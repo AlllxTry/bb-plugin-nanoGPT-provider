@@ -105,7 +105,7 @@ describe("the settings popup", () => {
       message: "NanoGPT rejected this API key. Check it and try again.",
     }));
     const view = renderPopup({ saveKey });
-    const input = (await view.findByPlaceholderText("sk-…")) as HTMLInputElement;
+    const input = (await view.findByPlaceholderText("sk-...")) as HTMLInputElement;
     expect(input.type).toBe("password");
     fireEvent.change(input, { target: { value: "  sk-typed  " } });
     fireEvent.click(view.getByText("Save"));
@@ -117,7 +117,7 @@ describe("the settings popup", () => {
 
   it("clears the field after a key is accepted", async () => {
     const view = renderPopup();
-    const input = (await view.findByPlaceholderText("sk-…")) as HTMLInputElement;
+    const input = (await view.findByPlaceholderText("sk-...")) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "sk-good" } });
     fireEvent.click(view.getByText("Save"));
     expect(await view.findByText("Key accepted.")).toBeTruthy();
@@ -126,7 +126,7 @@ describe("the settings popup", () => {
 
   it("is not a <form>, because bb mounts it inside the composer's own form", async () => {
     const view = renderPopup();
-    await view.findByPlaceholderText("sk-…");
+    await view.findByPlaceholderText("sk-...");
     expect(view.container.querySelector("form")).toBeNull();
     const save = view.getByText("Save").closest("button") as HTMLButtonElement;
     expect(save.type).toBe("button");
@@ -139,7 +139,7 @@ describe("the settings popup", () => {
       message: "Key accepted.",
     }));
     const view = renderPopup({ saveKey });
-    const input = await view.findByPlaceholderText("sk-…");
+    const input = await view.findByPlaceholderText("sk-...");
     fireEvent.change(input, { target: { value: "sk-enter" } });
     const notPrevented = fireEvent.keyDown(input, { key: "Enter" });
     expect(notPrevented).toBe(false);
@@ -155,7 +155,7 @@ describe("the settings popup", () => {
       message: "Key accepted.",
     }));
     const view = renderPopup({ saveKey });
-    const input = await view.findByPlaceholderText("sk-…");
+    const input = await view.findByPlaceholderText("sk-...");
     fireEvent.keyDown(input, { key: "Enter" });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(saveKey).not.toHaveBeenCalled();

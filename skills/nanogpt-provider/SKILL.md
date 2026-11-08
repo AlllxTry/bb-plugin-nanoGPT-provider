@@ -11,7 +11,7 @@ plugin settings.
 
 ## Where the user sets it up
 
-The composer has a gear for NanoGPT (also a "NanoGPT settings…" row in the `+`
+The composer has a gear for NanoGPT (also a "NanoGPT settings..." row in the `+`
 menu). It opens a form for the API key and base URL. The form checks the key
 with NanoGPT before saving it, so a rejected key is never stored. Point the user
 to it first; the commands below are the alternative.

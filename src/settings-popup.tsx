@@ -83,7 +83,7 @@ export function SettingsPopup() {
       <div className="flex items-center justify-between gap-2">
         <span className="text-sm font-medium text-foreground">NanoGPT</span>
         <span className={accepted ? "text-muted-foreground" : "text-warning"}>
-          {status === null ? "Checking…" : STATE_LABEL[status.state]}
+          {status === null ? "Checking..." : STATE_LABEL[status.state]}
         </span>
       </div>
 
@@ -96,7 +96,7 @@ export function SettingsPopup() {
           autoFocus
           value={apiKey}
           disabled={busy}
-          placeholder={accepted ? "Paste a new key to replace it" : "sk-…"}
+          placeholder={accepted ? "Paste a new key to replace it" : "sk-..."}
           onChange={(event) => setApiKey(event.target.value)}
           onKeyDown={saveOnEnter}
           className={INPUT_CLASS}
@@ -147,7 +147,7 @@ export function SettingsPopup() {
             disabled={busy || apiKey.trim() === ""}
             className="rounded-md bg-primary px-3 py-1 text-primary-foreground disabled:opacity-50"
           >
-            {busy ? "Checking…" : "Save"}
+            {busy ? "Checking..." : "Save"}
           </button>
         </div>
       </div>

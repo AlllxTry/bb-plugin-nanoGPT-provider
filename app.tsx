@@ -10,7 +10,7 @@ export default definePluginApp((app) => {
     plusMenu: [
       {
         id: "nanogpt-settings",
-        label: "NanoGPT settings…",
+        label: "NanoGPT settings...",
         description: "Set or change the NanoGPT API key.",
         icon: "Settings",
         run: ({ composer }) => {
