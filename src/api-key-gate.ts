@@ -8,6 +8,8 @@ export interface ApiKeyCheckArgs {
   apiKey: string;
   baseUrl: string | null;
   fetch?: typeof globalThis.fetch;
+  /** Told what NanoGPT answered. Never receives the key. */
+  log?: (detail: string) => void;
 }
 
 interface CheckRequest {
@@ -56,6 +58,8 @@ export async function checkApiKey(args: ApiKeyCheckArgs): Promise<ApiKeyState> {
       ...request.init,
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     });
+    const target = new URL(request.url);
+    args.log?.(`${request.init.method} ${target.host}${target.pathname} answered HTTP ${response.status}`);
     if (response.ok) {
       return "valid";
     }
@@ -63,7 +67,14 @@ export async function checkApiKey(args: ApiKeyCheckArgs): Promise<ApiKeyState> {
       return "invalid";
     }
     return "unknown";
-  } catch {
+  } catch (error) {
+    const reason =
+      error instanceof Error && error.name === "TimeoutError"
+        ? `no answer within ${CHECK_TIMEOUT_MS / 1000}s`
+        : error instanceof Error
+          ? error.message
+          : "request failed";
+    args.log?.(`could not reach NanoGPT: ${reason}`);
     return "unknown";
   }
 }

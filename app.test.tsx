@@ -124,6 +124,43 @@ describe("the settings popup", () => {
     expect(input.value).toBe("");
   });
 
+  it("is not a <form>, because bb mounts it inside the composer's own form", async () => {
+    const view = renderPopup();
+    await view.findByPlaceholderText("sk-…");
+    expect(view.container.querySelector("form")).toBeNull();
+    const save = view.getByText("Save").closest("button") as HTMLButtonElement;
+    expect(save.type).toBe("button");
+  });
+
+  it("saves when Enter is pressed in the key field, without submitting anything", async () => {
+    const saveKey = vi.fn(() => ({
+      saved: true,
+      state: "valid" as const,
+      message: "Key accepted.",
+    }));
+    const view = renderPopup({ saveKey });
+    const input = await view.findByPlaceholderText("sk-…");
+    fireEvent.change(input, { target: { value: "sk-enter" } });
+    const notPrevented = fireEvent.keyDown(input, { key: "Enter" });
+    expect(notPrevented).toBe(false);
+    await vi.waitFor(() =>
+      expect(saveKey).toHaveBeenCalledWith({ apiKey: "sk-enter", baseUrl: "" }),
+    );
+  });
+
+  it("ignores Enter while the key field is empty", async () => {
+    const saveKey = vi.fn(() => ({
+      saved: true,
+      state: "valid" as const,
+      message: "Key accepted.",
+    }));
+    const view = renderPopup({ saveKey });
+    const input = await view.findByPlaceholderText("sk-…");
+    fireEvent.keyDown(input, { key: "Enter" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(saveKey).not.toHaveBeenCalled();
+  });
+
   it("keeps Save disabled until a key is typed", async () => {
     const view = renderPopup();
     const save = (await view.findByText("Save")).closest("button") as HTMLButtonElement;

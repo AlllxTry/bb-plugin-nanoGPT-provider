@@ -1,5 +1,5 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { createApiKeyGate } from "./src/api-key-gate.js";
+import { checkApiKey, createApiKeyGate } from "./src/api-key-gate.js";
 import {
   nanoGptSettingsContract,
   REALTIME_KEY_STATE_CHANNEL,
@@ -35,7 +35,12 @@ export default function plugin(bb: BbPluginApi) {
     },
   });
 
-  const gate = createApiKeyGate();
+  const gate = createApiKeyGate((args) =>
+    checkApiKey({
+      ...args,
+      log: (detail) => bb.log.info(`key check: ${detail}`),
+    }),
+  );
   settings.onChange(() => {
     gate.clear();
   });
@@ -84,6 +89,7 @@ export default function plugin(bb: BbPluginApi) {
     async saveKey({ apiKey, baseUrl }) {
       const proposedBaseUrl = baseUrl === "" ? null : baseUrl;
       const state = await gate.verdict(apiKey, proposedBaseUrl);
+      bb.log.info(`saveKey: verdict ${state}`);
       if (state === "invalid") {
         return {
           saved: false,

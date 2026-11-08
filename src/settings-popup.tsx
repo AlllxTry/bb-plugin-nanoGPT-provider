@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useState, type KeyboardEvent } from "react";
 import { useComposer, useRpc } from "@get-bb/plugin-sdk/app";
 import { STATE_LABEL, useKeyStatus } from "./key-status.js";
 import type { nanoGptSettingsContract } from "./settings-contract.js";
@@ -25,8 +25,12 @@ export function SettingsPopup() {
   const baseUrl = baseUrlEdit ?? status?.baseUrl ?? "";
   const accepted = status?.state === "valid";
 
-  async function save(event: FormEvent) {
-    event.preventDefault();
+  /**
+   * This is deliberately not a <form>. The popup is mounted inside the
+   * composer, which sits in a form of its own; a nested form's submit would
+   * be handled by the browser (a page reload) instead of by this code.
+   */
+  async function save() {
     if (busy || apiKey.trim() === "") return;
     setBusy(true);
     setMessage(null);
@@ -63,9 +67,17 @@ export function SettingsPopup() {
     }
   }
 
+  function saveOnEnter(event: KeyboardEvent) {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    event.stopPropagation();
+    void save();
+  }
+
   return (
-    <form
-      onSubmit={(event) => void save(event)}
+    <div
+      role="group"
+      aria-label="NanoGPT settings"
       className="flex w-80 max-w-full flex-col gap-3 p-3 text-xs"
     >
       <div className="flex items-center justify-between gap-2">
@@ -86,6 +98,7 @@ export function SettingsPopup() {
           disabled={busy}
           placeholder={accepted ? "Paste a new key to replace it" : "sk-…"}
           onChange={(event) => setApiKey(event.target.value)}
+          onKeyDown={saveOnEnter}
           className={INPUT_CLASS}
         />
       </label>
@@ -100,6 +113,7 @@ export function SettingsPopup() {
           disabled={busy}
           placeholder="https://api.nano-gpt.com/api/v1"
           onChange={(event) => setBaseUrlEdit(event.target.value)}
+          onKeyDown={saveOnEnter}
           className={INPUT_CLASS}
         />
       </label>
@@ -128,7 +142,8 @@ export function SettingsPopup() {
             Close
           </button>
           <button
-            type="submit"
+            type="button"
+            onClick={() => void save()}
             disabled={busy || apiKey.trim() === ""}
             className="rounded-md bg-primary px-3 py-1 text-primary-foreground disabled:opacity-50"
           >
@@ -145,6 +160,6 @@ export function SettingsPopup() {
       >
         Get a NanoGPT API key
       </a>
-    </form>
+    </div>
   );
 }

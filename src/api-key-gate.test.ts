@@ -52,6 +52,35 @@ describe("checkApiKey", () => {
     expect(urls).toEqual(["https://api.nano-gpt.com/api/check-balance"]);
   });
 
+  it("logs what NanoGPT answered without ever logging the key", async () => {
+    const lines: string[] = [];
+    await checkApiKey({
+      apiKey: "sk-super-secret",
+      baseUrl: null,
+      fetch: async () => jsonResponse({ error: "no" }, 401),
+      log: (detail) => lines.push(detail),
+    });
+    expect(lines).toEqual([
+      "POST api.nano-gpt.com/api/check-balance answered HTTP 401",
+    ]);
+    expect(lines.join("\n")).not.toContain("sk-super-secret");
+  });
+
+  it("logs why NanoGPT could not be reached", async () => {
+    const lines: string[] = [];
+    await checkApiKey({
+      apiKey: "sk-super-secret",
+      baseUrl: null,
+      fetch: async () => {
+        throw new Error("getaddrinfo ENOTFOUND api.nano-gpt.com");
+      },
+      log: (detail) => lines.push(detail),
+    });
+    expect(lines).toEqual([
+      "could not reach NanoGPT: getaddrinfo ENOTFOUND api.nano-gpt.com",
+    ]);
+  });
+
   it("accepts a key NanoGPT authenticates", async () => {
     await expect(
       checkApiKey({

@@ -1,4 +1,4 @@
-# bb-plugin-nanoGPT-provider
+﻿# bb-plugin-nanoGPT-provider
 
 A [bb](https://github.com/get-bb/bb) **agent provider plugin** that connects bb to
 [NanoGPT](https://nano-gpt.com/api), one OpenAI-compatible API in front of
@@ -42,7 +42,7 @@ key that NanoGPT accepts is saved, the provider offers **no models at all**.
   the key, optionally set a base URL, and remove the key. You don't have to go to
   Plugins to set the plugin up. The key is checked with NanoGPT before it is
   saved, so a wrong key is never stored. The same form is in the composer's `+`
-  menu as "NanoGPT settings…".
+  menu as "NanoGPT settingsвЂ¦".
 - **Key stored as a secret setting**: bb keeps it in a `0600` file under the
   plugin data dir, never in the database. No RPC method returns it, so the
   frontend can write the key but never read it back.
@@ -81,12 +81,12 @@ Then, in bb:
 
 1. Click the **gear** in the composer (it shows while NanoGPT still needs a key,
    and whenever NanoGPT is the selected provider). The same form opens from the
-   composer's `+` menu, under "NanoGPT settings…".
+   composer's `+` menu, under "NanoGPT settingsвЂ¦".
 2. Paste your **NanoGPT API key** and press **Save**. The plugin checks the key
    with NanoGPT first. A rejected key is not saved.
 3. Choose **NanoGPT** in the provider picker and pick a model.
 
-Settings are also available the long way: Settings → Plugins → NanoGPT provider,
+Settings are also available the long way: Settings в†’ Plugins в†’ NanoGPT provider,
 or `bb plugin config nanogpt-provider`.
 
 > **Plugin id.** bb derives it from the package name by dropping the
@@ -259,7 +259,7 @@ Notes:
 
 ## Testing
 
-The suite has 43 tests and runs with `vitest` and the SDK's testing helpers. No
+The suite has 48 tests and runs with `vitest` and the SDK's testing helpers. No
 test touches the network, because `fetch` is stubbed.
 
 | Area         | What is covered                                                                                                          |
@@ -331,7 +331,7 @@ Oleksander Trybushnyi
 
 ## License
 
-[MIT](./LICENSE) © 2026 Oleksander Trybushnyi
+[MIT](./LICENSE) В© 2026 Oleksander Trybushnyi
 
 npm test
 ```
