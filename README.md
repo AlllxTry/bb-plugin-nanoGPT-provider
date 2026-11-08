@@ -20,6 +20,7 @@ key that NanoGPT accepts is saved, the provider offers **no models at all**.
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
 - [Limitations](#limitations)
+- [Support the project](#support-the-project)
 - [Author](#author)
 - [License](#license)
 
@@ -342,6 +343,25 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
   models. Not checked: a full chat turn against NanoGPT (streaming, reasoning and
   tool calls) on a real key. Those paths are covered by unit tests with a stubbed
   `fetch`, not by a live run.
+
+## Support the project
+
+This plugin is free and MIT licensed. If it saves you time, you can support its
+author with a donation in crypto. Thank you.
+
+| Asset | Network           | Address                                      |
+| ----- | ----------------- | -------------------------------------------- |
+| BTC   | Bitcoin           | `13BEg3VPxsiSfLhKNM1GnXEmy6kz23ybYz`         |
+| ETH   | Ethereum (ERC-20) | `0x94e35bfeee8f9d0338994acda2c9e8d7e3d9779d` |
+| USDT  | Tron (TRC-20)     | `TS9mfjWxhEtXt8omkyd3cUyvZmp1YBfJwW`         |
+| USDT  | Ethereum (ERC-20) | `0x94e35bfeee8f9d0338994acda2c9e8d7e3d9779d` |
+
+- Send each asset only on the network named in its row. A transfer on the wrong
+  network, for example USDT on Tron to the Ethereum address, cannot be recovered.
+- ETH and USDT on Ethereum use the same address.
+- Copy an address from this repository only. A copy on another site could have
+  been altered.
+- Donations are voluntary. They do not buy support and do not change the license.
 
 ## Author
 
