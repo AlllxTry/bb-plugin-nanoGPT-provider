@@ -153,6 +153,77 @@ async function startThread(): Promise<string> {
   return result.providerThreadId;
 }
 
+function toolRoundResponse(
+  callId: string,
+  args: string,
+  usage?: { prompt: number; completion: number },
+): Response {
+  return sseResponse([
+    chunk({
+      choices: [
+        {
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: callId,
+                function: { name: "read_file", arguments: args },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+      ...(usage === undefined
+        ? {}
+        : {
+            usage: {
+              prompt_tokens: usage.prompt,
+              completion_tokens: usage.completion,
+              total_tokens: usage.prompt + usage.completion,
+            },
+          }),
+    }),
+    "data: [DONE]\n\n",
+  ]);
+}
+
+function answerResponse(text: string): Response {
+  return sseResponse([
+    chunk({ choices: [{ delta: { content: text } }] }),
+    chunk({ choices: [{ delta: {}, finish_reason: "stop" }] }),
+    "data: [DONE]\n\n",
+  ]);
+}
+
+function toolCallRequests() {
+  return harness.messages.filter((m) => m.method === "item/tool/call");
+}
+
+function answerToolCall(index: number): void {
+  const call = toolCallRequests()[index];
+  handleLine(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: call.id,
+      result: {
+        success: true,
+        contentItems: [{ type: "inputText", text: "x" }],
+      },
+    }),
+  );
+}
+
+async function startTurn(text: string, requestId: string, providerThreadId: string) {
+  await request("turn/start", {
+    threadId: THREAD_ID,
+    providerThreadId,
+    input: [{ type: "text", text, mentions: [] }],
+    clientRequestId: requestId,
+    options: FULL_OPTIONS,
+  });
+}
+
 describe("the NanoGPT bridge", () => {
   it("answers initialize with grammar v3 capabilities", async () => {
     const response = await request("initialize", {
@@ -164,7 +235,7 @@ describe("the NanoGPT bridge", () => {
       protocolVersion: 2,
       capabilities: {
         grammarVersions: [3, 3],
-        sessionRestore: true,
+        sessionRestore: false,
         steerMode: "queue",
       },
     });
@@ -383,6 +454,154 @@ describe("the NanoGPT bridge", () => {
       supported: true,
       health: { status: "unauthenticated" },
     });
+  });
+
+  it("does not claim session restore on start or resume", async () => {
+    await initialize();
+    const started = await request("thread/start", {
+      threadId: THREAD_ID,
+      cwd: CWD,
+      instructionMode: "append",
+      dynamicTools: [],
+      options: FULL_OPTIONS,
+    });
+    expect(started.result).toMatchObject({ sessionRestorable: false });
+    const resumed = await request("thread/resume", {
+      threadId: THREAD_ID,
+      providerThreadId: "nano_gpt_old_1",
+      cwd: CWD,
+      instructionMode: "append",
+      dynamicTools: [],
+      options: FULL_OPTIONS,
+    });
+    expect(resumed.result).toMatchObject({ sessionRestorable: false });
+  });
+
+  it("sums token usage over every model round of a turn", async () => {
+    await initialize();
+    responses.push(
+      toolRoundResponse("call_0", '{"path":"a"}', { prompt: 100, completion: 1 }),
+      toolRoundResponse("call_0", '{"path":"b"}', { prompt: 200, completion: 1 }),
+      sseResponse([
+        chunk({ choices: [{ delta: { content: "ok" } }] }),
+        chunk({
+          choices: [{ delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 300, completion_tokens: 2, total_tokens: 302 },
+        }),
+        "data: [DONE]\n\n",
+      ]),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("go", "creq_abcdefgh73", providerThreadId);
+    for (let round = 0; round < 2; round += 1) {
+      await waitFor(() => toolCallRequests().length > round);
+      answerToolCall(round);
+    }
+    await waitFor(() => boundary("completed"));
+    const usage = (
+      deltaNotifications() as unknown as {
+        kind: string;
+        last: { inputTokens: number; outputTokens: number };
+      }[]
+    ).find((delta) => delta.kind === "usage");
+    expect(usage?.last.inputTokens).toBe(600);
+    expect(usage?.last.outputTokens).toBe(4);
+  });
+
+  it("uses unique item ids when the same call id repeats across rounds", async () => {
+    await initialize();
+    responses.push(
+      toolRoundResponse("call_0", '{"path":"a"}'),
+      toolRoundResponse("call_0", '{"path":"b"}'),
+      answerResponse("done"),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("go", "creq_abcdefgh62", providerThreadId);
+    for (let round = 0; round < 2; round += 1) {
+      await waitFor(() => toolCallRequests().length > round);
+      answerToolCall(round);
+    }
+    await waitFor(() => boundary("completed"));
+    const opened = (
+      deltaNotifications() as unknown as {
+        kind: string;
+        key?: { providerItemId: string };
+      }[]
+    )
+      .filter((delta) => delta.kind === "item.open")
+      .map((delta) => delta.key?.providerItemId);
+    expect(opened.length).toBeGreaterThan(2);
+    expect(new Set(opened).size).toBe(opened.length);
+  });
+
+  it("does not run a tool whose arguments are not valid JSON", async () => {
+    await initialize();
+    responses.push(
+      toolRoundResponse("call_bad", '{"path":'),
+      answerResponse("retrying"),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("go", "creq_abcdefgh63", providerThreadId);
+    await waitFor(() => boundary("completed"));
+    expect(toolCallRequests()).toHaveLength(0);
+    const secondRound = fetchCalls[1].body.messages as {
+      role: string;
+      content?: string;
+    }[];
+    expect(secondRound.at(-1)?.role).toBe("tool");
+    expect(secondRound.at(-1)?.content).toContain("The tool was not run");
+  });
+
+  it("settles a turn that is stopped while a tool call is pending", async () => {
+    await initialize();
+    responses.push(toolRoundResponse("call_1", '{"path":"a"}'));
+    const providerThreadId = await startThread();
+    await startTurn("go", "creq_abcdefgh64", providerThreadId);
+    await waitFor(() => toolCallRequests().length > 0);
+    const stop = await request("thread/stop", {
+      threadId: THREAD_ID,
+      providerThreadId,
+      intent: "interrupt",
+      activeTurnId: null,
+    });
+    expect(stop.error).toBeUndefined();
+    await waitFor(() => boundary("interrupted"));
+    // A late answer for the stopped call is ignored and must not throw.
+    answerToolCall(0);
+    expect(fetchCalls).toHaveLength(1);
+  });
+
+  it("queues a second turn/start instead of running two turns at once", async () => {
+    await initialize();
+    responses.push(
+      toolRoundResponse("call_1", '{"path":"a"}'),
+      answerResponse("first"),
+      answerResponse("second"),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("one", "creq_abcdefgh65", providerThreadId);
+    await waitFor(() => toolCallRequests().length > 0);
+    await startTurn("two", "creq_abcdefgh66", providerThreadId);
+    // The first turn still waits for its tool, so no second request yet.
+    expect(fetchCalls).toHaveLength(1);
+    answerToolCall(0);
+    await waitFor(() => fetchCalls.length === 3);
+    const secondTurn = fetchCalls[2].body.messages as {
+      role: string;
+      content?: string;
+    }[];
+    expect(secondTurn.at(-1)).toEqual({ role: "user", content: "two" });
+  });
+
+  it("fails a turn whose stream is cut off before it finished", async () => {
+    await initialize();
+    responses.push(
+      sseResponse([chunk({ choices: [{ delta: { content: "half an ans" } }] })]),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("hi", "creq_abcdefgh67", providerThreadId);
+    await waitFor(() => boundary("failed"));
+    expect(boundary("completed")).toBe(false);
   });
 
   it("rejects steering when no turn is active", async () => {

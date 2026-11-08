@@ -57,7 +57,7 @@ const STOP_SETTLE_TIMEOUT_MS = 2000;
 interface QueuedPrompt {
   input: readonly PromptInput[];
   options: TurnOptions;
-  clientRequestId: ClientTurnRequestId;
+  clientRequestId: ClientTurnRequestId | undefined;
 }
 
 interface Session {
@@ -172,8 +172,13 @@ function openSession(args: {
   return session;
 }
 
-function itemId(session: Session, name: string): string {
-  return `nano-gpt-${session.providerThreadId}-t${session.turnCounter}-${name}`;
+/**
+ * Timeline item ids must be unique per logical item. The round number keeps
+ * ids distinct across the model rounds of one turn (a tool-call id such as
+ * `call_0` repeats from round to round).
+ */
+function itemId(session: Session, name: string, round: number): string {
+  return `nano-gpt-${session.providerThreadId}-t${session.turnCounter}-r${round}-${name}`;
 }
 
 function userContent(input: readonly PromptInput[]): string | NanoGptContentPart[] {
@@ -233,24 +238,51 @@ function toolDefinitions(session: Session): NanoGptToolDefinition[] {
   }));
 }
 
-function parseToolArguments(raw: string): Record<string, unknown> {
+type ParsedToolArguments =
+  | { ok: true; value: Record<string, unknown> }
+  | { ok: false; error: string };
+
+/**
+ * Tool arguments come from the model and tools have side effects, so invalid
+ * JSON is an error, never an empty object. An empty string means "no
+ * arguments" and is valid.
+ */
+function parseToolArguments(raw: string): ParsedToolArguments {
+  const text = raw.trim() === "" ? "{}" : raw;
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(raw === "" ? "{}" : raw);
-    if (typeof parsed === "object" && parsed !== null) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    return {};
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "invalid JSON",
+    };
   }
-  return {};
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, error: "arguments must be a JSON object" };
+  }
+  return { ok: true, value: parsed as Record<string, unknown> };
 }
 
+const CANCELLED_TOOL_REPLY = {
+  content: "Tool call cancelled.",
+  isError: true,
+} as const;
+
+/**
+ * Asks bb to run a tool. The returned promise always settles: either bb
+ * answers, or the turn is aborted and the pending entry is removed.
+ */
 function requestToolCall(
   session: Session,
   callId: string,
   tool: string,
   args: Record<string, unknown>,
+  signal: AbortSignal,
 ): Promise<{ content: string; isError: boolean }> {
+  if (signal.aborted) {
+    return Promise.resolve(CANCELLED_TOOL_REPLY);
+  }
   const requestId = sendRequest(BRIDGE_INBOUND_REQUEST_METHODS.toolCall, {
     providerThreadId: session.providerThreadId,
     threadId: session.threadId,
@@ -260,7 +292,19 @@ function requestToolCall(
     arguments: args,
   });
   return new Promise((resolve) => {
-    pendingToolCalls.set(requestId, { session, resolve });
+    const onAbort = (): void => {
+      if (pendingToolCalls.delete(requestId)) {
+        resolve(CANCELLED_TOOL_REPLY);
+      }
+    };
+    pendingToolCalls.set(requestId, {
+      session,
+      resolve: (reply) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(reply);
+      },
+    });
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -285,6 +329,16 @@ function runTurn(args: {
   clientRequestId: ClientTurnRequestId | undefined;
 }): void {
   const { session } = args;
+  // One turn at a time per session: a second start waits in the queue instead
+  // of mutating the same message history in parallel.
+  if (session.activeTurn !== null) {
+    session.queue.push({
+      input: args.input,
+      options: args.options,
+      clientRequestId: args.clientRequestId,
+    });
+    return;
+  }
   const controller = new AbortController();
   const activeTurn: ActiveTurn = {
     controller,
@@ -378,9 +432,8 @@ async function runTurnWork(
   let messageTextKey: string | null = null;
   let messageText = "";
   let reasoningKey: string | null = null;
-  let turnUsage: ThreadEventTokenUsageBreakdown = estimatedUsage(
-    session.messages,
-  );
+  // Usage is summed over every model round of the turn.
+  let turnUsage: ThreadEventTokenUsageBreakdown = ZERO_TOKEN_USAGE;
 
   try {
     let rounds = 0;
@@ -395,6 +448,7 @@ async function runTurnWork(
       messageTextKey = null;
       messageText = "";
       reasoningKey = null;
+      const roundEstimate = estimatedUsage(session.messages);
 
       const stream = client.streamChatCompletion({
         model,
@@ -411,7 +465,7 @@ async function runTurnWork(
       for await (const event of stream) {
         if (event.type === "textDelta") {
           if (messageTextKey === null) {
-            messageTextKey = itemId(session, "message");
+            messageTextKey = itemId(session, "message", rounds);
             emitDeltas(threadId, [
               {
                 kind: "item.open",
@@ -433,7 +487,7 @@ async function runTurnWork(
         }
         if (event.type === "reasoningDelta") {
           if (reasoningKey === null) {
-            reasoningKey = itemId(session, "reasoning");
+            reasoningKey = itemId(session, "reasoning", rounds);
           }
           emitDeltas(threadId, [
             {
@@ -476,9 +530,7 @@ async function runTurnWork(
           finalContent === "" ? messageText : finalContent,
         );
       }
-      if (finalUsage !== null) {
-        turnUsage = finalUsage;
-      }
+      turnUsage = addTokenUsage(turnUsage, finalUsage ?? roundEstimate);
 
       if (finalToolCalls.length === 0) {
         session.messages.push({
@@ -495,8 +547,43 @@ async function runTurnWork(
       });
 
       for (const call of finalToolCalls) {
-        const callId = itemId(session, `tool-${call.id}`);
-        const toolArgs = parseToolArguments(call.function.arguments);
+        const callId = itemId(session, `tool-${call.id}`, rounds);
+        const parsedArgs = parseToolArguments(call.function.arguments);
+        if (!parsedArgs.ok) {
+          // Never run a tool with guessed arguments; tell the model so it can
+          // retry with valid JSON.
+          emitDeltas(threadId, [
+            {
+              kind: "item.open",
+              key: { providerItemId: callId },
+              item: {
+                type: "tool",
+                tool: call.function.name,
+                server: "bb",
+                args: {},
+              },
+            },
+            {
+              kind: "item.close",
+              key: { providerItemId: callId },
+              status: "failed",
+              item: {
+                type: "tool",
+                tool: call.function.name,
+                server: "bb",
+                args: {},
+                error: `Invalid tool arguments: ${parsedArgs.error}`,
+              },
+            },
+          ]);
+          session.messages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            content: `Error: the arguments for ${call.function.name} were not valid JSON (${parsedArgs.error}). The tool was not run. Call it again with a valid JSON object.`,
+          });
+          continue;
+        }
+        const toolArgs = parsedArgs.value;
         const presentation = toolPresentation(session, call.function.name);
         emitDeltas(threadId, [
           {
@@ -516,9 +603,10 @@ async function runTurnWork(
           callId,
           call.function.name,
           toolArgs,
+          signal,
         );
-        if (!sessions.has(threadId)) {
-          return;
+        if (signal.aborted || !sessions.has(threadId)) {
+          throw new DOMException("Turn aborted", "AbortError");
         }
         emitDeltas(threadId, [
           {
@@ -643,7 +731,9 @@ const handlers: Record<string, RequestHandler> = {
       protocolVersion: PROVIDER_BRIDGE_PROTOCOL_VERSION,
       capabilities: {
         grammarVersions: [THREAD_DELTA_GRAMMAR_V3, THREAD_DELTA_GRAMMAR_V3],
-        sessionRestore: true,
+        // The bridge keeps conversation history in memory only, so it cannot
+        // restore a session after a restart. Do not claim otherwise.
+        sessionRestore: false,
         threadArchive: false,
         threadRename: false,
         threadGoalClear: false,
@@ -732,7 +822,7 @@ const handlers: Record<string, RequestHandler> = {
       cwd: parsed.data.cwd,
       dynamicTools: parsed.data.dynamicTools,
     });
-    io.sendResult(id, { providerThreadId, sessionRestorable: true });
+    io.sendResult(id, { providerThreadId, sessionRestorable: false });
     if (parsed.data.input !== undefined && parsed.data.input.length > 0) {
       runTurn({
         session,
@@ -761,7 +851,7 @@ const handlers: Record<string, RequestHandler> = {
     });
     io.sendResult(id, {
       providerThreadId: parsed.data.providerThreadId,
-      sessionRestorable: true,
+      sessionRestorable: false,
     });
   },
 
@@ -839,6 +929,8 @@ const handlers: Record<string, RequestHandler> = {
       });
       return;
     }
+    // Releasing a thread must not leave its turn running in the background.
+    activeTurn?.controller.abort();
     sessions.delete(parsed.data.threadId);
     io.sendResult(id, {});
   },

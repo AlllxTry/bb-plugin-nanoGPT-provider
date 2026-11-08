@@ -147,6 +147,41 @@ describe("streamChatCompletion", () => {
     });
   });
 
+  it("fails a stream that ends with no [DONE] and no finish reason", async () => {
+    const client = createNanoGptClient({
+      apiKey: "sk-nano-test",
+      fetch: async () =>
+        sseResponse(chunk({ choices: [{ delta: { content: "cut o" } }] })),
+    });
+    await expect(
+      collect(
+        client.streamChatCompletion({
+          model: "x",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      ),
+    ).rejects.toBeInstanceOf(NanoGptApiError);
+  });
+
+  it("accepts a stream that ends with a finish reason but no [DONE]", async () => {
+    const client = createNanoGptClient({
+      apiKey: "sk-nano-test",
+      fetch: async () =>
+        sseResponse(
+          chunk({
+            choices: [{ delta: { content: "ok" }, finish_reason: "stop" }],
+          }),
+        ),
+    });
+    const events = await collect(
+      client.streamChatCompletion({
+        model: "x",
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    );
+    expect(events.at(-1)).toMatchObject({ type: "message", content: "ok" });
+  });
+
   it("maps HTTP errors to NanoGptApiError with the API message", async () => {
     const client = createNanoGptClient({
       apiKey: "bad",

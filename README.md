@@ -287,7 +287,7 @@ npm test
 | Area         | What is covered                                                                                                          |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | Client       | SSE streaming of text, reasoning, tool-call fragments and usage; HTTP error mapping; model list parsing.                 |
-| Bridge       | `initialize`, a full tool round, API errors, steering, health, model listing with and without a key, a turn with no key. |
+| Bridge       | `initialize`, a full tool round, API errors, steering, health, model listing with and without a key, a turn with no key, usage summed over rounds, unique item ids, invalid tool arguments, stop during a pending tool call, queued turns, cut-off streams, no restore claim. |
 | API key gate | valid, invalid and unknown verdicts, verdict caching, offline behaviour, re-check after a clear.                         |
 | Registration | provider declaration, env passthrough, and no env contribution without a saved key.                                      |
 | Settings RPC | a rejected or unreachable key is not saved; an accepted key is saved, announced over realtime and contributed as env; no result ever contains the key; a bad base URL is refused. |
@@ -327,8 +327,15 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
 
 ## Limitations
 
-- Conversation history lives in the bridge process. A daemon restart starts a
-  fresh history on `thread/resume`.
+- Conversation history lives in the bridge process only. The bridge does not
+  advertise session restore, so a thread resumed after a restart starts with an
+  empty model context.
+- Only one turn runs per thread at a time; a second message sent while a turn
+  runs is queued.
+- A stream that ends before NanoGPT signals completion fails the turn instead of
+  showing a partial answer.
+- Tool calls whose arguments are not valid JSON are not run; the model gets an
+  error and can retry.
 - Tool-result images are not sent back into the model context.
 - Local image and file attachments are sent as a text placeholder (their path or
   name), not their contents.
@@ -343,9 +350,11 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
   `nano-gpt` provider is registered, the gear and the settings form appear in the
   composer, a rejected key is not saved, a real key is accepted by NanoGPT, and
   the server then loads a catalog of 400 models. With no key the picker offers no
-  models. Not checked: a full chat turn against NanoGPT (streaming, reasoning and
-  tool calls) on a real key. Those paths are covered by unit tests with a stubbed
-  `fetch`, not by a live run.
+  models. The author also ran a live agent request against NanoGPT with a real
+  key and the API key check on plugin versions 0.1.0 to 0.1.2. The turn-lifecycle
+  fixes after 0.1.2 (queued turns, cancelled tool calls, summed usage, cut-off
+  streams) are covered by unit tests with a stubbed `fetch` and have not been
+  re-run live yet.
 
 ## Support the project
 

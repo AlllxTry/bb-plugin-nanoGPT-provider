@@ -246,6 +246,7 @@ export function createNanoGptClient(args: {
       let usage: NanoGptTokenUsage | null = null;
       const toolCalls = new Map<number, ToolCallAccumulator>();
       let doneStreaming = false;
+      let sawFinishReason = false;
 
       const handleData = (data: string): void => {
         if (data === "[DONE]") {
@@ -263,6 +264,12 @@ export function createNanoGptClient(args: {
           return;
         }
         for (const choice of parsed.data.choices ?? []) {
+          if (
+            typeof choice.finish_reason === "string" &&
+            choice.finish_reason !== ""
+          ) {
+            sawFinishReason = true;
+          }
           const delta = choice.delta;
           if (delta === undefined) {
             continue;
@@ -361,6 +368,17 @@ export function createNanoGptClient(args: {
       try {
         await reader.cancel();
       } catch {
+      }
+
+      // A stream that stops without [DONE] and without a finish_reason was cut
+      // off: the text or the tool-call arguments may be incomplete, so fail
+      // instead of presenting it as a finished answer.
+      if (!doneStreaming && !sawFinishReason) {
+        throw new NanoGptApiError({
+          status: 0,
+          message:
+            "The NanoGPT stream ended before the answer was complete. Please try again.",
+        });
       }
 
       const orderedCalls = [...toolCalls.entries()]
