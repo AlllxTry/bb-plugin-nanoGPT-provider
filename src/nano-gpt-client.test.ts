@@ -144,6 +144,7 @@ describe("streamChatCompletion", () => {
         },
       ],
       usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+      finishReason: "tool_calls",
     });
   });
 

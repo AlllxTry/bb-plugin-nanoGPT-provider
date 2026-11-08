@@ -604,6 +604,142 @@ describe("the NanoGPT bridge", () => {
     expect(boundary("completed")).toBe(false);
   });
 
+  it("acknowledges a steered input exactly once", async () => {
+    await initialize();
+    responses.push(
+      toolRoundResponse("call_1", '{"path":"a"}'),
+      answerResponse("first"),
+      answerResponse("steered"),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("one", "creq_abcdefgh78", providerThreadId);
+    await waitFor(() => toolCallRequests().length > 0);
+    const steer = await request("turn/steer", {
+      threadId: THREAD_ID,
+      providerThreadId,
+      input: [{ type: "text", text: "two", mentions: [] }],
+      clientRequestId: "creq_abcdefgh72",
+      expectedTurnId: "turn-1",
+      options: FULL_OPTIONS,
+    });
+    expect(steer.error).toBeUndefined();
+    answerToolCall(0);
+    await waitFor(() => fetchCalls.length === 3);
+    await waitFor(
+      () =>
+        deltaNotifications().filter(
+          (delta) => (delta as BoundaryDelta).kind === "turn.boundary",
+        ).length === 2,
+    );
+    const accepted = (deltaNotifications() as BoundaryDelta[]).filter(
+      (delta) => delta.kind === "input.accepted",
+    );
+    expect(accepted.map((delta) => delta.clientRequestId)).toEqual([
+      "creq_abcdefgh78",
+      "creq_abcdefgh72",
+    ]);
+  });
+
+  it("closes a pending tool item as interrupted when the turn is stopped", async () => {
+    await initialize();
+    responses.push(toolRoundResponse("call_1", '{"path":"a"}'));
+    const providerThreadId = await startThread();
+    await startTurn("go", "creq_abcdefgh74", providerThreadId);
+    await waitFor(() => toolCallRequests().length > 0);
+    await request("thread/stop", {
+      threadId: THREAD_ID,
+      providerThreadId,
+      intent: "interrupt",
+      activeTurnId: null,
+    });
+    await waitFor(() => boundary("interrupted"));
+    type ItemDelta = { kind: string; status?: string };
+    const deltas = deltaNotifications() as unknown as ItemDelta[];
+    const opened = deltas.filter((delta) => delta.kind === "item.open");
+    const closed = deltas.filter((delta) => delta.kind === "item.close");
+    expect(opened).toHaveLength(1);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].status).toBe("interrupted");
+    const boundaries = deltas.filter((delta) => delta.kind === "turn.boundary");
+    expect(boundaries).toHaveLength(1);
+  });
+
+  it("still ends an interrupt with an interrupted boundary when the request hangs", async () => {
+    await initialize();
+    // A response whose body never produces data and ignores the abort signal.
+    responses.push(
+      new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("hang", "creq_abcdefgh75", providerThreadId);
+    await waitFor(() => fetchCalls.length === 1);
+    const stop = await request("thread/stop", {
+      threadId: THREAD_ID,
+      providerThreadId,
+      intent: "interrupt",
+      activeTurn: null,
+      activeTurnId: null,
+    });
+    expect(stop.error).toBeUndefined();
+    expect(boundary("interrupted")).toBe(true);
+    const boundaries = (deltaNotifications() as BoundaryDelta[]).filter(
+      (delta) => delta.kind === "turn.boundary",
+    );
+    expect(boundaries).toHaveLength(1);
+  }, 10_000);
+
+  it("fails the turn instead of finishing it when the model hits its length limit", async () => {
+    await initialize();
+    responses.push(
+      sseResponse([
+        chunk({ choices: [{ delta: { content: "a long answ" } }] }),
+        chunk({ choices: [{ delta: {}, finish_reason: "length" }] }),
+        "data: [DONE]\n\n",
+      ]),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("write a lot", "creq_abcdefgh76", providerThreadId);
+    await waitFor(() => boundary("failed"));
+    expect(boundary("completed")).toBe(false);
+    const error = (deltaNotifications() as BoundaryDelta[]).find(
+      (delta) => delta.kind === "provider.error",
+    );
+    expect(error?.message).toContain("output length limit");
+    expect(toolCallRequests()).toHaveLength(0);
+  });
+
+  it("does not run a tool call that was cut off by the length limit", async () => {
+    await initialize();
+    responses.push(
+      sseResponse([
+        chunk({
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_cut",
+                    function: { name: "read_file", arguments: '{"path":"a' },
+                  },
+                ],
+              },
+              finish_reason: "length",
+            },
+          ],
+        }),
+        "data: [DONE]\n\n",
+      ]),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("go", "creq_abcdefgh77", providerThreadId);
+    await waitFor(() => boundary("failed"));
+    expect(toolCallRequests()).toHaveLength(0);
+  });
+
   it("rejects steering when no turn is active", async () => {
     await initialize();
     const providerThreadId = await startThread();

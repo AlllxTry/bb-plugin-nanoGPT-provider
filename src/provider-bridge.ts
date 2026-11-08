@@ -58,6 +58,8 @@ interface QueuedPrompt {
   input: readonly PromptInput[];
   options: TurnOptions;
   clientRequestId: ClientTurnRequestId | undefined;
+  /** True once `input.accepted` was sent (turn/steer acknowledges at once). */
+  accepted: boolean;
 }
 
 interface Session {
@@ -72,9 +74,24 @@ interface Session {
   queue: QueuedPrompt[];
 }
 
+interface OpenTool {
+  tool: string;
+  args: Record<string, unknown>;
+  presentation: DynamicTool["presentation"];
+}
+
+/** Everything a turn has opened in the timeline, so it can always be closed. */
 interface ActiveTurn {
   controller: AbortController;
   done: Promise<void>;
+  /** True once the turn has sent its single terminal `turn.boundary`. */
+  settled: boolean;
+  reasoningKey: string | null;
+  messageKey: string | null;
+  messageText: string;
+  openTools: Map<string, OpenTool>;
+  /** Tool-call ids the model issued that have no answer in the history yet. */
+  unansweredToolCalls: string[];
 }
 
 interface TurnOptions {
@@ -322,11 +339,121 @@ function estimatedUsage(messages: readonly NanoGptMessage[]): ThreadEventTokenUs
   };
 }
 
+function abortError(): DOMException {
+  return new DOMException("Turn aborted", "AbortError");
+}
+
+function newActiveTurn(): ActiveTurn {
+  return {
+    controller: new AbortController(),
+    done: Promise.resolve(),
+    settled: false,
+    reasoningKey: null,
+    messageKey: null,
+    messageText: "",
+    openTools: new Map(),
+    unansweredToolCalls: [],
+  };
+}
+
+type TurnOutcome =
+  | { status: "completed"; usage: ThreadEventTokenUsageBreakdown }
+  | { status: "interrupted" }
+  | { status: "failed"; message: string };
+
+/**
+ * The only place a turn ends. It closes every item the turn left open, keeps
+ * the model history valid (every tool call gets an answer), and sends exactly
+ * one terminal `turn.boundary`. Calling it again for the same turn does
+ * nothing, so stop, failure and normal completion can never both report.
+ */
+function settleTurn(
+  session: Session,
+  turn: ActiveTurn,
+  outcome: TurnOutcome,
+): void {
+  if (turn.settled) {
+    return;
+  }
+  turn.settled = true;
+  const itemStatus = outcome.status === "failed" ? "failed" : "interrupted";
+  const deltas: ThreadDelta[] = [];
+  if (turn.reasoningKey !== null) {
+    deltas.push({
+      kind: "item.textClose",
+      key: { providerItemId: turn.reasoningKey },
+      channel: "reasoningText",
+      text: "",
+    });
+    turn.reasoningKey = null;
+  }
+  if (turn.messageKey !== null) {
+    deltas.push({
+      kind: "item.textClose",
+      key: { providerItemId: turn.messageKey },
+      channel: "agentMessage",
+      text: turn.messageText,
+    });
+    turn.messageKey = null;
+  }
+  for (const [key, open] of turn.openTools) {
+    deltas.push({
+      kind: "item.close",
+      key: { providerItemId: key },
+      status: itemStatus,
+      item: {
+        type: "tool",
+        tool: open.tool,
+        server: "bb",
+        args: open.args,
+      },
+      ...(open.presentation === undefined
+        ? {}
+        : { presentation: open.presentation }),
+    });
+  }
+  turn.openTools.clear();
+  for (const callId of turn.unansweredToolCalls) {
+    session.messages.push({
+      role: "tool",
+      tool_call_id: callId,
+      content: "Tool call cancelled.",
+    });
+  }
+  turn.unansweredToolCalls = [];
+  if (outcome.status === "completed") {
+    session.usageTotal = addTokenUsage(session.usageTotal, outcome.usage);
+    deltas.push(
+      {
+        kind: "usage",
+        total: session.usageTotal,
+        last: outcome.usage,
+        modelContextWindow: null,
+      },
+      { kind: "turn.boundary", status: "completed" },
+    );
+  } else if (outcome.status === "interrupted") {
+    deltas.push({ kind: "turn.boundary", status: "interrupted" });
+  } else {
+    deltas.push(
+      { kind: "provider.error", message: outcome.message },
+      {
+        kind: "turn.boundary",
+        status: "failed",
+        error: { message: outcome.message },
+      },
+    );
+  }
+  emitDeltas(session.threadId, deltas);
+}
+
 function runTurn(args: {
   session: Session;
   input: readonly PromptInput[];
   options: TurnOptions;
   clientRequestId: ClientTurnRequestId | undefined;
+  /** True when `input.accepted` was already sent for this input. */
+  accepted: boolean;
 }): void {
   const { session } = args;
   // One turn at a time per session: a second start waits in the queue instead
@@ -336,18 +463,19 @@ function runTurn(args: {
       input: args.input,
       options: args.options,
       clientRequestId: args.clientRequestId,
+      accepted: args.accepted,
     });
     return;
   }
-  const controller = new AbortController();
-  const activeTurn: ActiveTurn = {
-    controller,
-    done: Promise.resolve(),
-  };
+  const activeTurn = newActiveTurn();
   session.activeTurn = activeTurn;
-  const work = runTurnWork(args, controller.signal)
+  const work = runTurnWork(args, activeTurn)
     .catch((error: unknown) => {
       console.error("nano-gpt turn failed", error);
+      settleTurn(session, activeTurn, {
+        status: "failed",
+        message: "The NanoGPT turn failed unexpectedly.",
+      });
     })
     .finally(() => {
       if (session.activeTurn === activeTurn) {
@@ -368,6 +496,7 @@ function drainQueue(session: Session): void {
     input: next.input,
     options: next.options,
     clientRequestId: next.clientRequestId,
+    accepted: next.accepted,
   });
 }
 
@@ -378,15 +507,35 @@ function toolPresentation(
   return session.tools.get(toolName)?.presentation;
 }
 
-function closeTextItem(
+/** Closes the text and reasoning items of one model round. */
+function closeRoundText(
   session: Session,
-  key: string,
-  channel: "agentMessage" | "reasoningText",
-  text: string,
+  turn: ActiveTurn,
+  finalText: string,
 ): void {
-  emitDeltas(session.threadId, [
-    { kind: "item.textClose", key: { providerItemId: key }, channel, text },
-  ]);
+  const deltas: ThreadDelta[] = [];
+  if (turn.reasoningKey !== null) {
+    deltas.push({
+      kind: "item.textClose",
+      key: { providerItemId: turn.reasoningKey },
+      channel: "reasoningText",
+      text: "",
+    });
+  }
+  if (turn.messageKey !== null) {
+    deltas.push({
+      kind: "item.textClose",
+      key: { providerItemId: turn.messageKey },
+      channel: "agentMessage",
+      text: finalText === "" ? turn.messageText : finalText,
+    });
+  }
+  turn.reasoningKey = null;
+  turn.messageKey = null;
+  turn.messageText = "";
+  if (deltas.length > 0) {
+    emitDeltas(session.threadId, deltas);
+  }
 }
 
 async function runTurnWork(
@@ -395,28 +544,37 @@ async function runTurnWork(
     input: readonly PromptInput[];
     options: TurnOptions;
     clientRequestId: ClientTurnRequestId | undefined;
+    accepted: boolean;
   },
-  signal: AbortSignal,
+  turn: ActiveTurn,
 ): Promise<void> {
   const { session } = args;
-  session.turnCounter += 1;
+  const signal = turn.controller.signal;
   const threadId = session.threadId;
+  session.turnCounter += 1;
 
-  if (args.clientRequestId !== undefined) {
-    emitDeltas(threadId, [
-      { kind: "input.accepted", clientRequestId: args.clientRequestId },
-    ]);
+  // Nothing may be emitted once the turn has settled (for example after a
+  // stop): the terminal boundary has already been sent.
+  const emit = (deltas: ThreadDelta[]): void => {
+    if (!turn.settled) {
+      emitDeltas(threadId, deltas);
+    }
+  };
+
+  // A steered prompt was acknowledged when it arrived; acknowledge every other
+  // input exactly once, here.
+  if (args.clientRequestId !== undefined && !args.accepted) {
+    emit([{ kind: "input.accepted", clientRequestId: args.clientRequestId }]);
   }
-  emitDeltas(threadId, [{ kind: "turn.open" }]);
+  emit([{ kind: "turn.open" }]);
 
   const key = apiKey(args.options.envVars);
   if (key === "") {
-    const message =
-      "No NanoGPT API key is configured; paste one into the NanoGPT provider plugin settings (get a key at https://nano-gpt.com/api).";
-    emitDeltas(threadId, [
-      { kind: "provider.error", message },
-      { kind: "turn.boundary", status: "failed", error: { message } },
-    ]);
+    settleTurn(session, turn, {
+      status: "failed",
+      message:
+        "No NanoGPT API key is configured; paste one into the NanoGPT provider plugin settings (get a key at https://nano-gpt.com/api).",
+    });
     return;
   }
 
@@ -428,10 +586,6 @@ async function runTurnWork(
     apiKey: key,
   });
   const tools = toolDefinitions(session);
-
-  let messageTextKey: string | null = null;
-  let messageText = "";
-  let reasoningKey: string | null = null;
   // Usage is summed over every model round of the turn.
   let turnUsage: ThreadEventTokenUsageBreakdown = ZERO_TOKEN_USAGE;
 
@@ -445,9 +599,6 @@ async function runTurnWork(
           message: `Stopped after ${MAX_TOOL_ROUNDS} tool rounds without a final answer.`,
         });
       }
-      messageTextKey = null;
-      messageText = "";
-      reasoningKey = null;
       const roundEstimate = estimatedUsage(session.messages);
 
       const stream = client.streamChatCompletion({
@@ -461,24 +612,28 @@ async function runTurnWork(
       let finalContent = "";
       let finalToolCalls: NanoGptToolCall[] = [];
       let finalUsage: ThreadEventTokenUsageBreakdown | null = null;
+      let finishReason: string | null = null;
 
       for await (const event of stream) {
+        if (turn.settled) {
+          throw abortError();
+        }
         if (event.type === "textDelta") {
-          if (messageTextKey === null) {
-            messageTextKey = itemId(session, "message", rounds);
-            emitDeltas(threadId, [
+          if (turn.messageKey === null) {
+            turn.messageKey = itemId(session, "message", rounds);
+            emit([
               {
                 kind: "item.open",
-                key: { providerItemId: messageTextKey },
+                key: { providerItemId: turn.messageKey },
                 item: { type: "agentMessage", text: "" },
               },
             ]);
           }
-          messageText += event.text;
-          emitDeltas(threadId, [
+          turn.messageText += event.text;
+          emit([
             {
               kind: "item.textDelta",
-              key: { providerItemId: messageTextKey },
+              key: { providerItemId: turn.messageKey },
               channel: "agentMessage",
               text: event.text,
             },
@@ -486,13 +641,13 @@ async function runTurnWork(
           continue;
         }
         if (event.type === "reasoningDelta") {
-          if (reasoningKey === null) {
-            reasoningKey = itemId(session, "reasoning", rounds);
+          if (turn.reasoningKey === null) {
+            turn.reasoningKey = itemId(session, "reasoning", rounds);
           }
-          emitDeltas(threadId, [
+          emit([
             {
               kind: "item.textDelta",
-              key: { providerItemId: reasoningKey },
+              key: { providerItemId: turn.reasoningKey },
               channel: "reasoningText",
               text: event.text,
             },
@@ -502,6 +657,7 @@ async function runTurnWork(
         sawFinal = true;
         finalContent = event.content;
         finalToolCalls = event.toolCalls;
+        finishReason = event.finishReason;
         finalUsage =
           event.usage === null
             ? null
@@ -519,24 +675,25 @@ async function runTurnWork(
           message: "NanoGPT stream ended without a final message.",
         });
       }
-      if (reasoningKey !== null) {
-        closeTextItem(session, reasoningKey, "reasoningText", "");
-      }
-      if (messageTextKey !== null) {
-        closeTextItem(
-          session,
-          messageTextKey,
-          "agentMessage",
-          finalContent === "" ? messageText : finalContent,
-        );
-      }
+      closeRoundText(session, turn, finalContent);
       turnUsage = addTokenUsage(turnUsage, finalUsage ?? roundEstimate);
 
-      if (finalToolCalls.length === 0) {
-        session.messages.push({
-          role: "assistant",
-          content: finalContent,
+      if (finishReason === "length") {
+        // The model hit its output limit: the text, and any tool-call
+        // arguments, are cut off. Keep what the user saw, but never present
+        // it as a finished answer and never run a half-written tool call.
+        if (finalContent !== "") {
+          session.messages.push({ role: "assistant", content: finalContent });
+        }
+        throw new NanoGptApiError({
+          status: 0,
+          message:
+            "The model stopped because it reached its output length limit, so the answer is incomplete. Ask it to continue, or choose a model with a larger output limit.",
         });
+      }
+
+      if (finalToolCalls.length === 0) {
+        session.messages.push({ role: "assistant", content: finalContent });
         break;
       }
 
@@ -545,14 +702,23 @@ async function runTurnWork(
         content: finalContent === "" ? null : finalContent,
         tool_calls: finalToolCalls,
       });
+      turn.unansweredToolCalls = finalToolCalls.map((call) => call.id);
+      const markAnswered = (id: string): void => {
+        turn.unansweredToolCalls = turn.unansweredToolCalls.filter(
+          (pendingId) => pendingId !== id,
+        );
+      };
 
       for (const call of finalToolCalls) {
+        if (signal.aborted || turn.settled) {
+          throw abortError();
+        }
         const callId = itemId(session, `tool-${call.id}`, rounds);
         const parsedArgs = parseToolArguments(call.function.arguments);
         if (!parsedArgs.ok) {
           // Never run a tool with guessed arguments; tell the model so it can
           // retry with valid JSON.
-          emitDeltas(threadId, [
+          emit([
             {
               kind: "item.open",
               key: { providerItemId: callId },
@@ -581,11 +747,17 @@ async function runTurnWork(
             tool_call_id: call.id,
             content: `Error: the arguments for ${call.function.name} were not valid JSON (${parsedArgs.error}). The tool was not run. Call it again with a valid JSON object.`,
           });
+          markAnswered(call.id);
           continue;
         }
         const toolArgs = parsedArgs.value;
         const presentation = toolPresentation(session, call.function.name);
-        emitDeltas(threadId, [
+        turn.openTools.set(callId, {
+          tool: call.function.name,
+          args: toolArgs,
+          presentation,
+        });
+        emit([
           {
             kind: "item.open",
             key: { providerItemId: callId },
@@ -605,10 +777,13 @@ async function runTurnWork(
           toolArgs,
           signal,
         );
-        if (signal.aborted || !sessions.has(threadId)) {
-          throw new DOMException("Turn aborted", "AbortError");
+        if (signal.aborted || turn.settled || !sessions.has(threadId)) {
+          // Left in openTools and unansweredToolCalls on purpose: settleTurn
+          // closes the item as interrupted and answers the call in history.
+          throw abortError();
         }
-        emitDeltas(threadId, [
+        turn.openTools.delete(callId);
+        emit([
           {
             kind: "item.close",
             key: { providerItemId: callId },
@@ -630,44 +805,23 @@ async function runTurnWork(
           tool_call_id: call.id,
           content: reply.content === "" ? "OK" : reply.content,
         });
+        markAnswered(call.id);
       }
-
     }
 
-    session.usageTotal = addTokenUsage(session.usageTotal, turnUsage);
-    emitDeltas(threadId, [
-      {
-        kind: "usage",
-        total: session.usageTotal,
-        last: turnUsage,
-        modelContextWindow: null,
-      },
-      { kind: "turn.boundary", status: "completed" },
-    ]);
+    settleTurn(session, turn, { status: "completed", usage: turnUsage });
   } catch (error) {
     const aborted =
       signal.aborted ||
       (error instanceof Error && error.name === "AbortError");
     if (aborted) {
-      if (reasoningKey !== null) {
-        closeTextItem(session, reasoningKey, "reasoningText", "");
-      }
-      if (messageTextKey !== null) {
-        closeTextItem(session, messageTextKey, "agentMessage", messageText);
-      }
-      emitDeltas(threadId, [{ kind: "turn.boundary", status: "interrupted" }]);
+      settleTurn(session, turn, { status: "interrupted" });
       return;
     }
-    const message =
-      error instanceof NanoGptApiError
-        ? error.message
-        : error instanceof Error
-          ? error.message
-          : String(error);
-    emitDeltas(threadId, [
-      { kind: "provider.error", message },
-      { kind: "turn.boundary", status: "failed", error: { message } },
-    ]);
+    settleTurn(session, turn, {
+      status: "failed",
+      message: error instanceof Error ? error.message : String(error),
+    });
   }
 }
 
@@ -829,6 +983,7 @@ const handlers: Record<string, RequestHandler> = {
         input: parsed.data.input,
         options: turnOptionsOf(parsed.data.options),
         clientRequestId: undefined,
+        accepted: false,
       });
     }
   },
@@ -876,6 +1031,7 @@ const handlers: Record<string, RequestHandler> = {
       input: parsed.data.input,
       options: turnOptionsOf(parsed.data.options),
       clientRequestId: parsed.data.clientRequestId,
+      accepted: false,
     });
   },
 
@@ -901,6 +1057,8 @@ const handlers: Record<string, RequestHandler> = {
       input: parsed.data.input,
       options: turnOptionsOf(parsed.data.options),
       clientRequestId: parsed.data.clientRequestId,
+      // Acknowledged just above; the queued run must not acknowledge it again.
+      accepted: true,
     });
     io.sendResult(id, {});
   },
@@ -924,13 +1082,21 @@ const handlers: Record<string, RequestHandler> = {
         setTimeout(resolve, STOP_SETTLE_TIMEOUT_MS).unref?.();
       });
       void Promise.race([activeTurn.done, timeout]).then(() => {
+        // If the turn did not settle in time (for example a hung request),
+        // settle it here so an interrupt always ends in an interrupted
+        // boundary. This is a no-op when the turn already settled.
+        settleTurn(session, activeTurn, { status: "interrupted" });
         sessions.delete(parsed.data.threadId);
         io.sendResult(id, {});
       });
       return;
     }
-    // Releasing a thread must not leave its turn running in the background.
-    activeTurn?.controller.abort();
+    if (activeTurn !== null) {
+      // A release is not an interruption: end the turn silently, without a
+      // terminal event, and make sure nothing more is emitted for it.
+      activeTurn.settled = true;
+      activeTurn.controller.abort();
+    }
     sessions.delete(parsed.data.threadId);
     io.sendResult(id, {});
   },

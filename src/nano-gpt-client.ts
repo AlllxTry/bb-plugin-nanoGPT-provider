@@ -54,6 +54,8 @@ export type NanoGptStreamEvent =
       content: string;
       toolCalls: NanoGptToolCall[];
       usage: NanoGptTokenUsage | null;
+      /** The model's last `finish_reason` ("stop", "tool_calls", "length"...). */
+      finishReason: string | null;
     };
 
 const toolCallFragmentSchema = z
@@ -247,6 +249,7 @@ export function createNanoGptClient(args: {
       const toolCalls = new Map<number, ToolCallAccumulator>();
       let doneStreaming = false;
       let sawFinishReason = false;
+      let finishReason: string | null = null;
 
       const handleData = (data: string): void => {
         if (data === "[DONE]") {
@@ -269,6 +272,7 @@ export function createNanoGptClient(args: {
             choice.finish_reason !== ""
           ) {
             sawFinishReason = true;
+            finishReason = choice.finish_reason;
           }
           const delta = choice.delta;
           if (delta === undefined) {
@@ -395,6 +399,7 @@ export function createNanoGptClient(args: {
         content: messageContent,
         toolCalls: orderedCalls,
         usage: finalUsage,
+        finishReason,
       };
 
     },

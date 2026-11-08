@@ -287,7 +287,7 @@ npm test
 | Area         | What is covered                                                                                                          |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | Client       | SSE streaming of text, reasoning, tool-call fragments and usage; HTTP error mapping; model list parsing.                 |
-| Bridge       | `initialize`, a full tool round, API errors, steering, health, model listing with and without a key, a turn with no key, usage summed over rounds, unique item ids, invalid tool arguments, stop during a pending tool call, queued turns, cut-off streams, no restore claim. |
+| Bridge       | `initialize`, a full tool round, API errors, steering, health, model listing with and without a key, a turn with no key, usage summed over rounds, unique item ids, invalid tool arguments, stop during a pending tool call (item closed as interrupted), a hung request on stop, queued turns, one acknowledgement per steered input, cut-off and length-limited streams, no restore claim. |
 | API key gate | valid, invalid and unknown verdicts, verdict caching, offline behaviour, re-check after a clear.                         |
 | Registration | provider declaration, env passthrough, and no env contribution without a saved key.                                      |
 | Settings RPC | a rejected or unreachable key is not saved; an accepted key is saved, announced over realtime and contributed as env; no result ever contains the key; a bad base URL is refused. |
@@ -333,7 +333,14 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
 - Only one turn runs per thread at a time; a second message sent while a turn
   runs is queued.
 - A stream that ends before NanoGPT signals completion fails the turn instead of
-  showing a partial answer.
+  showing a partial answer. A reply cut off by the model's output length limit
+  (`finish_reason: length`) also fails the turn with a clear message, and a tool
+  call cut off that way is never run.
+- Every turn ends with exactly one terminal event. Stopping a turn closes any
+  tool item that was still running as interrupted and answers its tool call in
+  the model history. A stop that the request does not honour in time still ends
+  with an interrupted event.
+- A queued follow-up message is acknowledged once, when it arrives.
 - Tool calls whose arguments are not valid JSON are not run; the model gets an
   error and can retry.
 - Tool-result images are not sent back into the model context.
