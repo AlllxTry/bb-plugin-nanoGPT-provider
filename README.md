@@ -8,6 +8,8 @@ Install the plugin, paste your NanoGPT API key into the plugin settings, and
 **NanoGPT appears in bb's provider picker with the live model catalog**. Until a
 key that NanoGPT accepts is saved, the provider offers **no models at all**.
 
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
+
 - [Features](#features)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
@@ -33,7 +35,8 @@ key that NanoGPT accepts is saved, the provider offers **no models at all**.
   - **tool calling** through bb's dynamic tools, with multi-round tool use
     (up to 40 rounds per turn),
   - token **usage** reporting,
-  - image inputs passed through as `image_url` parts.
+  - image URLs passed through as `image_url` parts (local images are only
+    described to the model, see [Limitations](#limitations)).
 - **Attached text files** (the paperclip or add-file button) are read by the plugin
   and sent to the model inline, up to 100000 bytes per file.
 - **Live model catalog** from `GET /models`, listed only for a key that NanoGPT
@@ -49,8 +52,11 @@ key that NanoGPT accepts is saved, the provider offers **no models at all**.
 - **Key stored as a secret setting**: bb keeps it in a `0600` file under the
   plugin data dir, never in the database. No RPC method returns it, so the
   frontend can write the key but never read it back.
-- **Steering and interruption**: follow-up messages sent mid-turn are queued, and
-  `thread/stop` aborts the in-flight request.
+- **Steering and interruption**: only one turn runs per thread at a time, so a
+  follow-up message sent mid-turn is queued and acknowledged once. `thread/stop`
+  aborts the in-flight request, cancels a pending tool call, closes any open tool
+  item as interrupted, drops queued follow-ups, and ends the turn with exactly one
+  `interrupted` event. An API request that never answers is released too.
 - **Configurable base URL** to point at any other OpenAI-compatible endpoint
   (for example NanoGPT's `/api/v1legacy`).
 - Built on the **public plugin SDK only** (`@get-bb/plugin-sdk`), with no
@@ -60,7 +66,7 @@ key that NanoGPT accepts is saved, the provider offers **no models at all**.
 
 | Requirement | Version / note                                                      |
 | ----------- | ------------------------------------------------------------------- |
-| bb          | Desktop app or server with the plugin system and the `bb` CLI       |
+| bb          | 0.49 or newer (`engines.bb`), with the `bb` CLI. Tested on 0.49.0.   |
 | Node.js     | 22.19 or newer, for tests and typecheck (bb bundles its own)        |
 | NanoGPT key | Create one at <https://nano-gpt.com/api>                            |
 | Plugin SDK  | `@get-bb/plugin-sdk` `>=0.6.133` (declared in `engines.bbPluginSdk`) |
@@ -73,11 +79,11 @@ bb can install the plugin straight from Git. bb builds it on your machine, so yo
 need no clone and no build step:
 
 ```bash
-bb plugin install git:https://github.com/AlllxTry/bb-plugin-nanoGPT-provider.git@^0.1.0
+bb plugin install git:https://github.com/AlllxTry/bb-plugin-nanoGPT-provider.git@^0.1.3
 bb plugin update nanogpt-provider      # later, to pick up a newer release
 ```
 
-The `@^0.1.0` part follows the repository's `vX.Y.Z` release tags, so
+The `@^0.1.3` part follows the repository's `vX.Y.Z` release tags, so
 `bb plugin update` only moves to compatible releases. Then continue with the
 steps under "Then, in bb" below.
 
@@ -216,7 +222,9 @@ The plugin has four parts, mirroring bb's provider plugin model:
 - **The bridge** (`src/provider-bridge.ts`) speaks bb's provider bridge protocol
   (grammar v3). For each turn it streams a chat completion, runs any tool calls
   through bb (`item/tool/call` requests), appends the results, and loops until
-  the model returns a final answer or the 40-round limit is hit.
+  the model returns a final answer or the 40-round limit is hit. Every turn ends
+  through one settle step, which closes open items and sends a single terminal
+  event (`completed`, `interrupted` or `failed`).
 
 ## Project layout
 
@@ -239,6 +247,9 @@ The plugin has four parts, mirroring bb's provider plugin model:
 |   `-- vocabulary.ts          # Constants, provider options schema, helpers
 |-- *.test.ts, src/*.test.ts   # Unit tests (vitest)
 |-- assets/icon.svg            # Plugin and provider icon (single-colour vector, themed by bb)
+|-- skills/nanogpt-provider/SKILL.md  # Setup and troubleshooting notes for agents, shipped with the plugin
+|-- PLUGIN_OVERVIEW.md         # Text for the marketplace page
+|-- CHANGELOG.md               # What changed in each release
 |-- package.json               # The plugin manifest lives under the "bb" key
 |-- tsconfig.json
 |-- vitest.config.ts
@@ -248,7 +259,7 @@ The plugin has four parts, mirroring bb's provider plugin model:
 | File                     | Responsibility                                                                                                                    |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
 | `src/nano-gpt-client.ts` | `streamChatCompletion` (SSE parsing, text and reasoning deltas, tool-call fragments, usage), `listModels`, typed `NanoGptApiError`. |
-| `src/provider-bridge.ts` | Session map, turn queue, steering, stop and interrupt, thread delta emission, tool round loop, model list, health.                |
+| `src/provider-bridge.ts` | Session map, turn queue, steering, stop and interrupt, `settleTurn` (the single place a turn ends), thread delta emission, tool round loop, model list, health. |
 | `src/attachments.ts`     | `describeAttachedFile`: inlines attached text files for the model, describes binary, unreadable and over-long ones honestly. |
 | `src/api-key-gate.ts`    | `checkApiKey` (valid, invalid or unknown) and `createApiKeyGate` (verdict cache and offline behaviour).                           |
 | `src/vocabulary.ts`      | Provider id (`nano-gpt`), default base URL, env var names, default model, `MAX_TOOL_ROUNDS`.                                      |
@@ -290,7 +301,7 @@ npm test
 
 | Area         | What is covered                                                                                                          |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| Client       | SSE streaming of text, reasoning, tool-call fragments and usage; HTTP error mapping; model list parsing.                 |
+| Client       | SSE streaming of text, reasoning, tool-call fragments and usage; HTTP error mapping; model list parsing; aborting a read or a fetch that never returns; cancelling a response that arrives after the abort; cut-off streams. |
 | Bridge       | `initialize`, a full tool round, API errors, steering, health, model listing with and without a key, a turn with no key, usage summed over rounds, unique item ids, invalid tool arguments, stop during a pending tool call (item closed as interrupted), a request hung before or after the headers (released by the abort, late responses dropped, another thread still runs), a queued follow-up dropped on stop, attached text files read and sent inline (text, long, binary, empty, unreadable), queued turns, one acknowledgement per steered input, cut-off and length-limited streams, no restore claim. |
 | API key gate | valid, invalid and unknown verdicts, verdict caching, offline behaviour, re-check after a clear.                         |
 | Registration | provider declaration, env passthrough, and no env contribution without a saved key.                                      |
@@ -310,7 +321,10 @@ npm test
 | Build error: cannot resolve `@get-bb/plugin-sdk/...` | Run `npm install` first so the SDK is present in `node_modules`.                                                  |
 | `server.test.ts` fails with a missing package        | Install the dev dependencies. For `better-sqlite3`, run `npm rebuild better-sqlite3`.                             |
 | Client errors on reasoning output                    | Set `baseUrl` to `https://api.nano-gpt.com/api/v1legacy`.                                                         |
-| 402 or "No balance" errors                           | Your NanoGPT account is out of balance. Top it up on nano-gpt.com.                                                |
+| 402 or "No balance" errors                           | Your NanoGPT account is out of balance, or the model is not in your subscription and is billed from the balance. Top it up on nano-gpt.com or pick another model. |
+| The model says it cannot read a file, or guesses     | A NanoGPT thread has no file tools in bb. Attach the file with the paperclip or add-file button: text files are sent to the model inline. Binary files and images are not readable. |
+| "reached its output length limit"                    | The model stopped because its reply hit the output limit. Ask it to continue, or pick a model with a larger limit.  |
+| "stream ended before the answer was complete"        | NanoGPT closed the connection early. Send the message again.                                                       |
 
 Plugin logs: `bb plugin logs nanogpt-provider`.
 
@@ -325,8 +339,10 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
   reports provider environment values as-is in its **"Provider environment
   resolved"** diagnostic events, so the key can appear there when diagnostics are
   enabled. Treat diagnostic logs as sensitive.
-- The plugin sends your prompts, tool results and attached images to NanoGPT, or
-  to whatever `baseUrl` you set. Review NanoGPT's privacy terms before use.
+- The plugin sends your prompts, tool results, attached text files and attached
+  images to NanoGPT, or to whatever `baseUrl` you set. It reads an attached file
+  only from the path bb stages for the thread, up to 100000 bytes, and no other
+  file. Review NanoGPT's privacy terms before use.
 - The key is validated against NanoGPT only, with `POST /api/check-balance`.
 
 ## Limitations
@@ -418,4 +434,3 @@ Oleksander Trybushnyi
 ## License
 
 [MIT](./LICENSE) (c) 2026 Oleksander Trybushnyi
-
