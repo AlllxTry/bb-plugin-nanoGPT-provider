@@ -160,7 +160,25 @@ describe("streamChatCompletion", () => {
         }),
     });
     const controller = new AbortController();
-    const started = Date.now();
+    const pending = collect(
+      client.streamChatCompletion({
+        model: "x",
+        messages: [{ role: "user", content: "hi" }],
+        signal: controller.signal,
+      }),
+    );
+    setTimeout(() => controller.abort(), 20);
+    // No wall-clock bound needed: if the read were not released, this would
+    // never settle and the test would fail on the runner's own timeout.
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("ends a request whose fetch never returns when the signal aborts", async () => {
+    const client = createNanoGptClient({
+      apiKey: "sk-nano-test",
+      fetch: () => new Promise<Response>(() => undefined),
+    });
+    const controller = new AbortController();
     const pending = collect(
       client.streamChatCompletion({
         model: "x",
@@ -170,7 +188,41 @@ describe("streamChatCompletion", () => {
     );
     setTimeout(() => controller.abort(), 20);
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
-    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it("cancels the body of a response that arrives after the abort", async () => {
+    let cancelled = false;
+    let deliver: (response: Response) => void = () => undefined;
+    const client = createNanoGptClient({
+      apiKey: "sk-nano-test",
+      fetch: () =>
+        new Promise<Response>((resolve) => {
+          deliver = resolve;
+        }),
+    });
+    const controller = new AbortController();
+    const pending = collect(
+      client.streamChatCompletion({
+        model: "x",
+        messages: [{ role: "user", content: "hi" }],
+        signal: controller.signal,
+      }),
+    );
+    setTimeout(() => controller.abort(), 10);
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    deliver(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start() {},
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(cancelled).toBe(true);
   });
 
   it("rejects at once when the signal is already aborted", async () => {

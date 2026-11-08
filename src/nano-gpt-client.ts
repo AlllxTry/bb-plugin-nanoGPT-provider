@@ -63,34 +63,64 @@ function abortError(): DOMException {
 }
 
 /**
- * `reader.read()` that also ends when the signal aborts. A standards-compliant
- * `fetch` already rejects an aborted read; this keeps the turn from hanging
- * if a transport ignores the signal and never produces another chunk.
+ * Waits for `promise`, but gives up with an AbortError as soon as the signal
+ * aborts. A standards-compliant `fetch` already rejects on abort; this keeps a
+ * turn from hanging when a transport ignores the signal, whether it stalls
+ * before the response headers or after them. It only releases the caller: it
+ * cannot free resources a broken transport holds. A value that arrives after
+ * the abort is handed to `onLateValue` so it can be discarded cleanly.
  */
+function raceAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+  onLateValue?: (value: T) => void,
+): Promise<T> {
+  if (signal === undefined) {
+    return promise;
+  }
+  if (signal.aborted) {
+    promise.then(onLateValue, () => undefined);
+    return Promise.reject(abortError());
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const onAbort = (): void => {
+      if (!settled) {
+        settled = true;
+        reject(abortError());
+      }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        if (settled) {
+          onLateValue?.(value);
+          return;
+        }
+        settled = true;
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      },
+    );
+  });
+}
+
+function discardLateResponse(response: Response): void {
+  response.body?.cancel().catch(() => undefined);
+}
+
 function readWithAbort(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   signal: AbortSignal | undefined,
 ): Promise<ReadableStreamReadResult<Uint8Array>> {
-  if (signal === undefined) {
-    return reader.read();
-  }
-  if (signal.aborted) {
-    return Promise.reject(abortError());
-  }
-  return new Promise((resolve, reject) => {
-    const onAbort = (): void => reject(abortError());
-    signal.addEventListener("abort", onAbort, { once: true });
-    reader.read().then(
-      (result) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(result);
-      },
-      (error: unknown) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error);
-      },
-    );
-  });
+  return raceAbort(reader.read(), signal);
 }
 
 const toolCallFragmentSchema = z
@@ -220,8 +250,11 @@ export function createNanoGptClient(args: {
     };
   }
 
-  async function fail(response: Response): Promise<never> {
-    const detail = await readErrorBody(response);
+  async function fail(
+    response: Response,
+    signal?: AbortSignal,
+  ): Promise<never> {
+    const detail = await raceAbort(readErrorBody(response), signal);
     throw new NanoGptApiError({
       status: response.status,
       message: `NanoGPT API error ${response.status}: ${detail}`,
@@ -230,13 +263,17 @@ export function createNanoGptClient(args: {
 
   return {
     async listModels(signal) {
-      const response = await fetchImpl(`${baseUrl}/models`, {
-        method: "GET",
-        headers: authHeaders(),
+      const response = await raceAbort(
+        fetchImpl(`${baseUrl}/models`, {
+          method: "GET",
+          headers: authHeaders(),
+          signal,
+        }),
         signal,
-      });
+        discardLateResponse,
+      );
       if (!response.ok) {
-        await fail(response);
+        await fail(response, signal);
       }
       const parsed = modelListSchema.safeParse(await response.json());
       if (!parsed.success) {
@@ -258,14 +295,21 @@ export function createNanoGptClient(args: {
       if (streamArgs.tools !== undefined && streamArgs.tools.length > 0) {
         body.tools = streamArgs.tools;
       }
-      const response = await fetchImpl(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: authHeaders(),
-        body: JSON.stringify(body),
-        signal: streamArgs.signal,
-      });
+      if (streamArgs.signal?.aborted === true) {
+        throw abortError();
+      }
+      const response = await raceAbort(
+        fetchImpl(`${baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify(body),
+          signal: streamArgs.signal,
+        }),
+        streamArgs.signal,
+        discardLateResponse,
+      );
       if (!response.ok) {
-        await fail(response);
+        await fail(response, streamArgs.signal);
       }
       if (response.body === null) {
         throw new NanoGptApiError({
@@ -409,9 +453,11 @@ export function createNanoGptClient(args: {
         }
         yield* drainCollected();
       } finally {
-        // Always release the connection, on success, error and abort. The
-        // cancel is not awaited: a misbehaving transport may never settle it,
-        // and that must not keep this generator (or the turn) alive.
+        // Always ask the transport to drop the connection, on success, error
+        // and abort. The cancel is requested but not awaited, so a
+        // misbehaving transport that never settles it cannot keep this
+        // generator (or the turn) alive. This is best-effort cleanup; it
+        // cannot force a broken transport to release its resources.
         reader.cancel().catch(() => undefined);
       }
 

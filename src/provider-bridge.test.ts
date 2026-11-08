@@ -196,6 +196,23 @@ function answerResponse(text: string): Response {
   ]);
 }
 
+function deltaMessages() {
+  return harness.messages.filter((message) => message.method === "thread/delta");
+}
+
+/** True when the sample is non-empty and every notification is for `threadId`. */
+function onlyThread(
+  messages: readonly { params?: unknown }[],
+  threadId: string,
+): boolean {
+  return (
+    messages.length > 0 &&
+    messages.every(
+      (message) => (message.params as { threadId: string }).threadId === threadId,
+    )
+  );
+}
+
 function toolCallRequests() {
   return harness.messages.filter((m) => m.method === "item/tool/call");
 }
@@ -712,7 +729,8 @@ describe("the NanoGPT bridge", () => {
       intent: "interrupt",
       activeTurnId: null,
     });
-    const staleCount = deltaNotifications().length;
+    // Count notifications, the same unit used for the check below.
+    const countAtStop = deltaMessages().length;
 
     const otherThread = "thr_nano_gpt_other";
     const started = await request("thread/start", {
@@ -732,13 +750,115 @@ describe("the NanoGPT bridge", () => {
       options: FULL_OPTIONS,
     });
     await waitFor(() => boundary("completed"));
-    const later = harness.messages
-      .filter((message) => message.method === "thread/delta")
-      .map((message) => message.params as { threadId: string });
-    // Everything emitted after the stop belongs to the other thread only.
-    expect(
-      later.slice(staleCount).every((params) => params.threadId === otherThread),
-    ).toBe(true);
+    const afterStop = deltaMessages().slice(countAtStop);
+    // A non-empty sample, so an empty list cannot pass vacuously.
+    expect(afterStop.length).toBeGreaterThan(0);
+    expect(onlyThread(afterStop, otherThread)).toBe(true);
+  }, 10_000);
+
+  it("the isolation check fails when a stale notification leaks in", () => {
+    const own = { params: { threadId: "thr_b" } };
+    const stale = { params: { threadId: "thr_a" } };
+    expect(onlyThread([own, own], "thr_b")).toBe(true);
+    expect(onlyThread([own, stale], "thr_b")).toBe(false);
+    expect(onlyThread([], "thr_b")).toBe(false);
+  });
+
+  it("ends an interrupt with one boundary when fetch never returns", async () => {
+    await initialize();
+    // fetch ignores the signal and never settles: no response, no reader.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init: unknown) => {
+        fetchCalls.push({
+          url: String(url),
+          body: JSON.parse(String((init as RequestInit).body ?? "{}")),
+        });
+        return new Promise<Response>(() => undefined);
+      }),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("hang", "creq_abcdefgh7b", providerThreadId);
+    await waitFor(() => fetchCalls.length === 1);
+    const stop = await request("thread/stop", {
+      threadId: THREAD_ID,
+      providerThreadId,
+      intent: "interrupt",
+      activeTurnId: null,
+    });
+    expect(stop.error).toBeUndefined();
+    expect(boundary("interrupted")).toBe(true);
+    const boundaries = (deltaNotifications() as BoundaryDelta[]).filter(
+      (delta) => delta.kind === "turn.boundary",
+    );
+    expect(boundaries).toHaveLength(1);
+  }, 10_000);
+
+  it("discards a queued follow-up when the turn is stopped", async () => {
+    await initialize();
+    responses.push(
+      toolRoundResponse("call_1", '{"path":"a"}'),
+      answerResponse("must never be requested"),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("one", "creq_abcdefgh7d", providerThreadId);
+    await waitFor(() => toolCallRequests().length > 0);
+    const steer = await request("turn/steer", {
+      threadId: THREAD_ID,
+      providerThreadId,
+      input: [{ type: "text", text: "two", mentions: [] }],
+      clientRequestId: "creq_abcdefgh7e",
+      expectedTurnId: "turn-1",
+      options: FULL_OPTIONS,
+    });
+    expect(steer.error).toBeUndefined();
+    await request("thread/stop", {
+      threadId: THREAD_ID,
+      providerThreadId,
+      intent: "interrupt",
+      activeTurnId: null,
+    });
+    answerToolCall(0);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // The queued input is dropped: no second model request, one boundary.
+    expect(fetchCalls).toHaveLength(1);
+    const boundaries = (deltaNotifications() as BoundaryDelta[]).filter(
+      (delta) => delta.kind === "turn.boundary",
+    );
+    expect(boundaries).toHaveLength(1);
+    expect(boundaries[0].status).toBe("interrupted");
+  });
+
+  it("drops a response that arrives after the turn was stopped", async () => {
+    await initialize();
+    let release: (response: Response) => void = () => undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init: unknown) => {
+        fetchCalls.push({
+          url: String(url),
+          body: JSON.parse(String((init as RequestInit).body ?? "{}")),
+        });
+        return new Promise<Response>((resolve) => {
+          release = resolve;
+        });
+      }),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("late", "creq_abcdefgh7c", providerThreadId);
+    await waitFor(() => fetchCalls.length === 1);
+    await request("thread/stop", {
+      threadId: THREAD_ID,
+      providerThreadId,
+      intent: "interrupt",
+      activeTurnId: null,
+    });
+    const countAtStop = deltaMessages().length;
+    release(answerResponse("too late"));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Nothing from the late response may reach the timeline.
+    expect(deltaMessages().length).toBe(countAtStop);
+    expect(toolCallRequests()).toHaveLength(0);
   }, 10_000);
 
   it("fails the turn instead of finishing it when the model hits its length limit", async () => {
