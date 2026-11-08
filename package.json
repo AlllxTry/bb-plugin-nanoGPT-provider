@@ -1,0 +1,46 @@
+{
+  "name": "bb-plugin-nano-gpt",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "bb agent provider for NanoGPT's OpenAI-compatible API.",
+  "engines": {
+    "bb": ">=0.0",
+    "bbPluginSdk": ">=0.6.0"
+  },
+  "bb": {
+    "name": "NanoGPT provider",
+    "description": "Connects bb to NanoGPT's OpenAI-compatible API (https://api.nano-gpt.com/api/v1) for chat, streaming, and tool calls across its model catalog.",
+    "branding": {
+      "icon": "Zap"
+    },
+    "server": "./server.ts",
+    "host": "./host.ts"
+  },
+  "keywords": [
+    "bb-plugin"
+  ],
+  "scripts": {
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "bb plugin build .",
+    "install:bb": "bb plugin install . --yes",
+    "dev": "bb plugin dev ."
+  },
+  "dependencies": {
+    "@get-bb/plugin-sdk": "^0.6.133",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "better-sqlite3": "^12.11.1",
+    "cron-parser": "^5.10.4",
+    "hono": "^4.13.16",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.12"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true
+  }
+}

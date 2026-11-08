@@ -1,0 +1,57 @@
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { describe, expect, it } from "vitest";
+import nanoGptPlugin from "./server.js";
+import {
+  NANO_GPT_API_KEY_ENV,
+  NANO_GPT_BASE_URL_ENV,
+  NANO_GPT_PROVIDER_ID,
+} from "./src/vocabulary.js";
+
+function registeredDeclaration() {
+  const host = createFakePluginHost({ pluginId: "nano-gpt" });
+  nanoGptPlugin(host.bb);
+  const declaration = host.harness.registrations.providerRegistrations.find(
+    (entry) => entry.id === NANO_GPT_PROVIDER_ID,
+  );
+  if (declaration === undefined) {
+    throw new Error(`provider "${NANO_GPT_PROVIDER_ID}" was not registered`);
+  }
+  return { host, declaration };
+}
+
+const ENV_CONTEXT = { threadId: null, projectId: null, hostId: "host-1" };
+
+describe("the NanoGPT provider registration", () => {
+  it("registers the provider with no models until a key is accepted", () => {
+    const { declaration } = registeredDeclaration();
+    expect(declaration.displayName).toBe("NanoGPT");
+    expect(declaration.maintenance).toEqual({
+      health: true,
+      usage: false,
+      installation: false,
+    });
+    expect(declaration.models?.fallback).toEqual([]);
+  });
+
+  it("passes the API key and base URL environment through to the bridge", () => {
+    expect(registeredDeclaration().declaration.env?.passthrough).toEqual([
+      NANO_GPT_API_KEY_ENV,
+      NANO_GPT_BASE_URL_ENV,
+    ]);
+  });
+
+  it("contributes no environment while no API key is saved", async () => {
+    const { host } = registeredDeclaration();
+    await expect(
+      host.harness.behavior.resolveProviderEnv(
+        NANO_GPT_PROVIDER_ID,
+        ENV_CONTEXT,
+      ),
+    ).resolves.toEqual([]);
+    await expect(
+      host.harness.behavior.resolveProviderEnvHealth(NANO_GPT_PROVIDER_ID, {
+        hostId: "host-1",
+      }),
+    ).resolves.toBeNull();
+  });
+});

@@ -1,0 +1,292 @@
+﻿# bb-plugin-nano-gpt
+
+A [bb](https://github.com/get-bb/bb) **agent provider plugin** that connects bb to
+[NanoGPT](https://nano-gpt.com/api), one OpenAI-compatible API in front of
+1,000+ models.
+
+Install the plugin, paste your NanoGPT API key into the plugin settings, and
+**NanoGPT appears in bb's provider picker with the live model catalog**. Until a
+key that NanoGPT accepts is saved, the provider offers **no models at all**.
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [How the API key gate works](#how-the-api-key-gate-works)
+- [Architecture](#architecture)
+- [Project layout](#project-layout)
+- [Development](#development)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Security notes](#security-notes)
+- [Limitations](#limitations)
+- [License](#license)
+
+---
+
+## Features
+
+- **Full agent loop** against NanoGPT's `POST /chat/completions`:
+  - streaming responses (SSE) with separate **text** and **reasoning** channels,
+  - **tool calling** through bb's dynamic tools, with multi-round tool use
+    (up to 40 rounds per turn),
+  - token **usage** reporting,
+  - image inputs passed through as `image_url` parts.
+- **Live model catalog** from `GET /models`, listed only for a validated key.
+  The default model is `openai/gpt-6.1-sol`, and the first 400 models are shown.
+- **API key gate**: models and credentials are unavailable until NanoGPT accepts
+  the key (see [below](#how-the-api-key-gate-works)).
+- **Key stored as a secret setting**: bb keeps it in a `0600` file under the
+  plugin data dir, never in the database and never sent to the frontend.
+- **Steering and interruption**: follow-up messages sent mid-turn are queued, and
+  `thread/stop` aborts the in-flight request.
+- **Configurable base URL** to point at any other OpenAI-compatible endpoint
+  (for example NanoGPT's `/api/v1legacy`).
+- Built on the **public plugin SDK only** (`@get-bb/plugin-sdk`), with no
+  first-party privileges.
+
+## Requirements
+
+| Requirement | Version / note                                                      |
+| ----------- | ------------------------------------------------------------------- |
+| bb          | Desktop app or server with the plugin system and the `bb` CLI       |
+| Node.js     | 22.19 or newer, for tests and typecheck (bb bundles its own)        |
+| NanoGPT key | Create one at <https://nano-gpt.com/api>                            |
+| Plugin SDK  | `@get-bb/plugin-sdk` `>=0.6.0` (declared in `engines.bbPluginSdk`)  |
+
+## Quick start
+
+```bash
+# 1. Get the code and dependencies
+git clone https://github.com/AlllxTry/bb-nanoGPT-plugin.git
+cd bb-nanoGPT-plugin
+npm install
+
+# 2. Make sure bb is running (start the desktop app, or your bb server)
+
+# 3. Build the plugin and install it into bb
+npm run build
+npm run install:bb        # = bb plugin install . --yes
+```
+
+Then, in bb:
+
+1. Open the **NanoGPT provider** plugin's settings.
+2. Paste your **NanoGPT API key**.
+3. Reload the plugin (`bb plugin reload nano-gpt`) or restart bb.
+4. Choose **NanoGPT** in the provider picker and pick a model.
+
+> **Plugin id.** bb derives it from the package name by dropping the
+> `bb-plugin-` prefix, so `bb-plugin-nano-gpt` becomes `nano-gpt`. That is the id
+> every `bb plugin ...` command in this README uses. `bb plugin list` shows it.
+
+> `bb` must be on your `PATH`. On Windows the desktop installer puts it at
+> `%USERPROFILE%\.bb\bin\bb.cmd`. If your terminal can't find `bb`, call it by
+> full path or add that folder to `PATH`.
+
+> If `bb plugin install` fails with `Cannot connect to BB server`, bb isn't
+> running. Start it and retry.
+
+## Configuration
+
+All configuration lives in the plugin's bb settings. Use the settings UI, or the
+CLI:
+
+```bash
+bb plugin config nano-gpt                         # show settings
+bb plugin config nano-gpt set apiKey sk-nano-...  # set the key
+bb plugin config nano-gpt set baseUrl https://api.nano-gpt.com/api/v1legacy
+bb plugin config nano-gpt unset baseUrl
+bb plugin reload nano-gpt
+```
+
+| Setting   | Type            | Default | Description                                                                              |
+| --------- | --------------- | ------- | ---------------------------------------------------------------------------------------- |
+| `apiKey`  | string (secret) | none    | Your NanoGPT API key. Required. NanoGPT models appear only after the key is accepted.    |
+| `baseUrl` | string          | empty   | Override the API base URL. Empty means `https://api.nano-gpt.com/api/v1`.                |
+
+NanoGPT documents `https://api.nano-gpt.com/api/v1legacy` as a base URL for
+clients that fail on reasoning output. Set it as `baseUrl` if you hit that.
+
+
+## How the API key gate works
+
+The goal: **no valid key, no models.**
+
+1. The plugin reads `apiKey` from its settings.
+2. It asks NanoGPT (`GET /models`, 4-second timeout) whether the key is accepted:
+   - **HTTP 200**: the key is valid.
+   - **HTTP 401 or 403**: the key is rejected.
+   - **Network error, timeout, or any other status**: the verdict is unknown.
+3. Only a **valid** key is handed to the provider. bb does this by contributing it
+   as an environment variable (`NANOGPT_API_KEY`) to the NanoGPT bridge process.
+4. The bridge lists models **only** if it received a key. With no key it answers
+   `model/list` with an empty list, and a turn fails with a message that points
+   at the plugin settings.
+5. Verdicts are cached for 60 seconds. The cache is cleared whenever a plugin
+   setting changes, so pasting a new key takes effect right away.
+6. When NanoGPT can't be reached (verdict *unknown*), a key that was accepted
+   earlier in the same session keeps working. A key that was never checked does
+   not.
+
+The plugin also contributes a health message to bb: while a key is accepted, bb
+can show that it is using the key saved in the plugin settings. When no key is
+saved, the plugin marks itself as needing configuration.
+
+## Architecture
+
+The plugin has three parts, mirroring bb's provider plugin model:
+
+```
++------------------------- bb server -------------------------+
+| server.ts                                                   |
+|  - defines settings (apiKey, baseUrl)                       |
+|  - registers the "nano-gpt" provider (no fallback models)   |
+|  - API key gate -> contributes the NANOGPT_API_KEY env      |
++------------------------------+------------------------------+
+                               | env + provider options
++------------------------- host daemon ----------------------+
+| host.ts  (bb.host artifact, built to dist/host.js)          |
+|  - exports the provider bridge (JSON-RPC over stdio)        |
+|  - exports a small host RPC entry (hostInfo)                |
++------------------------------+------------------------------+
+                               | HTTPS, Bearer token
+                      +--------v---------+
+                      |   NanoGPT API    |
+                      |   /models        |
+                      |   /chat/completions
+                      +------------------+
+```
+
+- **`server.ts`** runs inside the bb server. It owns the settings, the provider
+  registration and the key gate. It never sees conversation content.
+- **`host.ts`** is bundled into `dist/host.js` and run by the bb host daemon. It
+  exports the provider bridge, which is where the agent loop lives.
+- **The bridge** (`src/provider-bridge.ts`) speaks bb's provider bridge protocol
+  (grammar v3). For each turn it streams a chat completion, runs any tool calls
+  through bb (`item/tool/call` requests), appends the results, and loops until
+  the model returns a final answer or the 40-round limit is hit.
+
+## Project layout
+
+```
+.
+|-- server.ts                  # Plugin entry (bb.server): settings, provider, key gate
+|-- host.ts                    # Host entry (bb.host): bridge + host RPC
+|-- contract.ts                # Host RPC contract (hostInfo)
+|-- src/
+|   |-- api-key-gate.ts        # Key validation + verdict cache
+|   |-- nano-gpt-client.ts     # HTTP client: SSE streaming, tool-call assembly, models
+|   |-- provider-bridge.ts     # Bridge: sessions, turns, tool loop, JSON-RPC
+|   `-- vocabulary.ts          # Constants, provider options schema, helpers
+|-- *.test.ts, src/*.test.ts   # Unit tests (vitest)
+|-- package.json               # The plugin manifest lives under the "bb" key
+|-- tsconfig.json
+|-- vitest.config.ts
+`-- LICENSE
+```
+
+| File                     | Responsibility                                                                                                                    |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `src/nano-gpt-client.ts` | `streamChatCompletion` (SSE parsing, text and reasoning deltas, tool-call fragments, usage), `listModels`, typed `NanoGptApiError`. |
+| `src/provider-bridge.ts` | Session map, turn queue, steering, stop and interrupt, thread delta emission, tool round loop, model list, health.                |
+| `src/api-key-gate.ts`    | `checkApiKey` (valid, invalid or unknown) and `createApiKeyGate` (verdict cache and offline behaviour).                           |
+| `src/vocabulary.ts`      | Provider id (`nano-gpt`), default base URL, env var names, default model, `MAX_TOOL_ROUNDS`.                                      |
+
+## Development
+
+```bash
+npm install            # install dependencies
+npm test               # run the unit tests
+npm run typecheck      # tsc --noEmit
+npm run build          # bb plugin build .  -> dist/server.js, dist/host.js
+npm run install:bb     # bb plugin install . --yes
+npm run dev            # bb plugin dev .   -> rebuild and reload on every change
+```
+
+Notes:
+
+- `npm run build` and the other `bb plugin ...` scripts need the `bb` CLI on your
+  `PATH`. Install and dev also need a running bb.
+- The plugin is installed **from its local path**. After editing sources, run
+  `npm run build` and `bb plugin reload nano-gpt`, or use `npm run dev` to do both
+  on every change.
+- The SDK's test helpers import `better-sqlite3`, `cron-parser` and `hono`, so
+  they are listed as dev dependencies. `better-sqlite3` needs its install script
+  to run, and npm 12 blocks install scripts by default. `package.json` already
+  carries an `allowScripts` entry for it. If the native module is missing, run
+  `npm rebuild better-sqlite3`.
+- The upstream bb monorepo typechecks with `tsrs`, which has no Windows build.
+  This repo uses the regular TypeScript compiler.
+
+## Testing
+
+The suite has 22 tests and runs with `vitest` and the SDK's testing helpers. No
+test touches the network, because `fetch` is stubbed.
+
+| Area         | What is covered                                                                                                          |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| Client       | SSE streaming of text, reasoning, tool-call fragments and usage; HTTP error mapping; model list parsing.                 |
+| Bridge       | `initialize`, a full tool round, API errors, steering, health, model listing with and without a key, a turn with no key. |
+| API key gate | valid, invalid and unknown verdicts, verdict caching, offline behaviour, re-check after a clear.                         |
+| Registration | provider declaration, env passthrough, and no env contribution without a saved key.                                      |
+| Host         | one host artifact exports both a provider bridge and a host RPC entry.                                                   |
+
+```bash
+
+## Troubleshooting
+
+| Symptom                                              | Likely cause and fix                                                                                              |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| NanoGPT shows no models                              | No key saved, or NanoGPT rejected it. Check the key at nano-gpt.com/api and save it again in the plugin settings. |
+| Key saved but models still missing                   | NanoGPT was unreachable and the key was never validated this session. Check connectivity, then reload the plugin. |
+| Turn fails with "No NanoGPT API key is configured"   | The bridge received no key. Save a valid key in the plugin settings and reload the plugin.                        |
+| `Cannot connect to BB server`                        | bb isn't running, or `BB_SERVER_URL` is wrong. Start bb and retry.                                                |
+| `bb` is not recognised                               | Add the bb CLI folder to `PATH`, or call it by full path (`%USERPROFILE%\.bb\bin\bb.cmd` on Windows).             |
+| Build error: cannot resolve `@get-bb/plugin-sdk/...` | Run `npm install` first so the SDK is present in `node_modules`.                                                  |
+| `server.test.ts` fails with a missing package        | Install the dev dependencies. For `better-sqlite3`, run `npm rebuild better-sqlite3`.                             |
+| Client errors on reasoning output                    | Set `baseUrl` to `https://api.nano-gpt.com/api/v1legacy`.                                                         |
+| 402 or "No balance" errors                           | Your NanoGPT account is out of balance. Top it up on nano-gpt.com.                                                |
+
+Plugin logs: `bb plugin logs nano-gpt`.
+
+## Security notes
+
+- Plugins are **full-trust code** that runs inside the bb server. They can read
+  all local bb data, including other plugins' secrets. Install only code you
+  trust, and read this repo before you do.
+- The API key is a **secret setting**: bb stores it in a `0600` file under the
+  plugin data directory, not in its database, and never sends it to the frontend.
+- The key is passed to the NanoGPT bridge process as an environment variable. bb
+  reports provider environment values as-is in its **"Provider environment
+  resolved"** diagnostic events, so the key can appear there when diagnostics are
+  enabled. Treat diagnostic logs as sensitive.
+- The plugin sends your prompts, tool results and attached images to NanoGPT, or
+  to whatever `baseUrl` you set. Review NanoGPT's privacy terms before use.
+- The key is validated against NanoGPT only, with `GET /models`.
+
+## Limitations
+
+- Conversation history lives in the bridge process. A daemon restart starts a
+  fresh history on `thread/resume`.
+- Tool-result images are not sent back into the model context.
+- Local image and file attachments are sent as a text placeholder (their path or
+  name), not their contents.
+- The reasoning-level picker (low, medium, high) is **not** forwarded to the API
+  as `reasoning_effort`, because some routed providers reject it.
+- Only the `full` permission mode is offered. There is no fork, archive, rename,
+  manual compaction or service tier support.
+- The model list is capped at 400 entries, with a few preferred models first.
+- Model descriptions are generic, and context-window sizes are not reported.
+- Mobile and web clients have not been tested.
+- The plugin has not yet been run inside a live bb. The tests and the build
+  pass, but the end-to-end flow (key saved, models appear, a turn runs) is
+  unverified.
+
+## License
+
+[MIT](./LICENSE)
+
+npm test
+```
+
