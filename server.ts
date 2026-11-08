@@ -125,7 +125,7 @@ export default function plugin(bb: BbPluginApi) {
   bb.providers.register({
     id: NANO_GPT_PROVIDER_ID,
     displayName: "NanoGPT",
-    icon: "Zap",
+    icon: "./assets/icon.svg",
     strings: {
       signInHint: SETUP_HINT,
       expiredHint: `NanoGPT rejected the API key. Click the gear in the composer to update it.`,

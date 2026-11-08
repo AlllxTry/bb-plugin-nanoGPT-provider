@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import nanoGptPlugin from "./server.js";
@@ -31,6 +32,25 @@ describe("the NanoGPT provider registration", () => {
       installation: false,
     });
     expect(declaration.models?.fallback).toEqual([]);
+  });
+
+  it("uses the plugin's own SVG as the provider icon, and that file is a clean vector mark", () => {
+    const { declaration } = registeredDeclaration();
+    expect(declaration.icon).toBe("./assets/icon.svg");
+    const manifest = JSON.parse(
+      readFileSync(new URL("./package.json", import.meta.url), "utf8"),
+    ) as { bb: { branding: { icon: string } } };
+    expect(manifest.bb.branding.icon).toBe("./assets/icon.svg");
+    const svg = readFileSync(
+      new URL("./assets/icon.svg", import.meta.url),
+      "utf8",
+    );
+    expect(svg).toMatch(/^<svg\b[^>]*xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+    expect(svg).toContain('fill="currentColor"');
+    expect(svg).not.toMatch(
+      /<(script|style|image|foreignObject|a)\b|<\?xml|<!DOCTYPE|\bon[a-z]+=|href=|url\(/i,
+    );
+    expect(Buffer.byteLength(svg)).toBeLessThanOrEqual(32 * 1024);
   });
 
   it("passes the API key and base URL environment through to the bridge", () => {

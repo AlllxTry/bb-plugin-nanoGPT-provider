@@ -18,7 +18,7 @@
     "name": "NanoGPT provider",
     "description": "Use NanoGPT's models in bb threads: paste an API key and the live model catalog appears.",
     "branding": {
-      "icon": "Zap"
+      "icon": "./assets/icon.svg"
     },
     "server": "./server.ts",
     "app": "./app.tsx",

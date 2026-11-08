@@ -235,6 +235,7 @@ The plugin has four parts, mirroring bb's provider plugin model:
 |   |-- settings-popup.tsx     # The key form
 |   `-- vocabulary.ts          # Constants, provider options schema, helpers
 |-- *.test.ts, src/*.test.ts   # Unit tests (vitest)
+|-- assets/icon.svg            # Plugin and provider icon (single-colour vector, themed by bb)
 |-- package.json               # The plugin manifest lives under the "bb" key
 |-- tsconfig.json
 |-- vitest.config.ts
