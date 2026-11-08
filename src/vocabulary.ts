@@ -75,3 +75,14 @@ export function modelDisplayName(modelId: string): string {
 }
 
 export const MAX_TOOL_ROUNDS = 40;
+
+// Retry configuration for transient HTTP errors
+export const RETRY_CONFIG = {
+  maxRetries: 3,
+  baseDelayMs: 1000,
+  maxDelayMs: 10_000,
+  jitterMs: 500,
+  retryableStatusCodes: [429, 502, 503, 504] as const,
+};
+
+export type RetryConfig = typeof RETRY_CONFIG;

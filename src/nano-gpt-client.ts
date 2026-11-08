@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { normalizeBaseUrl } from "./base-url.js";
-import { nanoGptModelIdSchema, normalizeModelId } from "./vocabulary.js";
+import { nanoGptModelIdSchema, normalizeModelId, RETRY_CONFIG } from "./vocabulary.js";
+
+const debug = process.env.NANOGPT_DEBUG === "1" ? console.error : () => undefined;
 
 export const MODEL_LIST_TIMEOUT_MS = 10_000;
 export const STREAM_IDLE_TIMEOUT_MS = 120_000;
@@ -125,6 +127,42 @@ function raceAbort<T>(
 
 function discardLateResponse(response: Response): void {
   response.body?.cancel().catch(() => undefined);
+}
+
+/** Check if an HTTP status code is retryable (transient error). */
+function isRetryableStatus(status: number): boolean {
+  return RETRY_CONFIG.retryableStatusCodes.includes(status as typeof RETRY_CONFIG.retryableStatusCodes[number]);
+}
+
+/** Calculate delay for next retry with exponential backoff and jitter. */
+function calculateRetryDelay(attempt: number, response: Response | null): number {
+  // Check for Retry-After header on 429
+  if (response?.status === 429) {
+    const retryAfter = response.headers.get("Retry-After");
+    if (retryAfter !== null) {
+      const seconds = Number.parseInt(retryAfter, 10);
+      if (!Number.isNaN(seconds)) return seconds * 1000;
+    }
+  }
+  // Exponential backoff: baseDelay * 2^attempt
+  const exponentialDelay = RETRY_CONFIG.baseDelayMs * Math.pow(2, attempt);
+  // Add jitter
+  const jitter = Math.floor(Math.random() * (RETRY_CONFIG.jitterMs * 2)) - RETRY_CONFIG.jitterMs;
+  // Cap at maxDelayMs, ensure minimum 100ms
+  return Math.max(Math.min(exponentialDelay + jitter, RETRY_CONFIG.maxDelayMs), 100);
+}
+
+/** Sleep for specified ms, respecting abort signal. */
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw abortError();
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+    if (signal) {
+      const onAbort = (): void => { clearTimeout(timer); reject(abortError()); };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
 }
 
 async function withDeadline<T>(
@@ -324,27 +362,47 @@ export function createNanoGptClient(args: {
       if (streamArgs.signal?.aborted === true) {
         throw abortError();
       }
-      const response = await withDeadline((signal) => raceAbort(
-        fetchImpl(`${baseUrl}/chat/completions`, {
-          method: "POST",
-          headers: authHeaders(),
-          body: JSON.stringify(body),
-          signal,
-        }),
-        signal,
-        discardLateResponse,
-      ), streamArgs.signal, STREAM_IDLE_TIMEOUT_MS, "NanoGPT did not return response headers in time. Please try again.");
-      if (!response.ok) {
-        await withDeadline((signal) => fail(response, signal), streamArgs.signal, STREAM_IDLE_TIMEOUT_MS, "NanoGPT timed out while returning an error response.");
-      }
-      if (response.body === null) {
-        throw new NanoGptApiError({
-          status: response.status,
-          message: "NanoGPT stream returned no response body",
-        });
-      }
+      // Retry loop for transient errors
+      let lastResponse: Response | null = null;
+      for (let attempt = 0; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
+        if (attempt > 0) {
+          const delay = calculateRetryDelay(attempt, lastResponse);
+          debug?.(`NanoGPT retry: attempt ${attempt + 1}/${RETRY_CONFIG.maxRetries + 1}, waiting ${delay}ms`);
+          await sleep(delay, streamArgs.signal);
+        }
 
-      const reader = response.body.getReader();
+        let response: Response;
+        try {
+          response = await withDeadline((signal) => raceAbort(
+            fetchImpl(`${baseUrl}/chat/completions`, {
+              method: "POST",
+              headers: authHeaders(),
+              body: JSON.stringify(body),
+              signal,
+            }),
+            signal,
+            discardLateResponse,
+          ), streamArgs.signal, STREAM_IDLE_TIMEOUT_MS, "NanoGPT did not return response headers in time. Please try again.");
+        } catch (err) {
+          // Timeout or abort - fail immediately, don't retry
+          if (err instanceof DOMException && err.name === "AbortError") throw err;
+          if (err instanceof NanoGptTimeoutError) throw err;
+          if (attempt >= RETRY_CONFIG.maxRetries) throw err;
+          debug?.(`NanoGPT request failed: ${err instanceof Error ? err.message : err}, retrying...`);
+          continue;
+        }
+
+        lastResponse = response;
+
+        if (response.ok) {
+          if (response.body === null) {
+            throw new NanoGptApiError({
+              status: response.status,
+              message: "NanoGPT stream returned no response body",
+            });
+          }
+
+          const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       let content = "";
@@ -569,6 +627,34 @@ export function createNanoGptClient(args: {
         usage,
         finishReason,
       };
+
+      // Success - exit retry loop
+      return;
+    }
+
+    // Non-OK response - read error body first for a good message
+    if (!response.ok) {
+      try {
+        await withDeadline((signal) => fail(response, signal), streamArgs.signal, STREAM_IDLE_TIMEOUT_MS, "NanoGPT timed out while returning an error response.");
+      } catch (err) {
+        // Timeout reading error body - propagate immediately
+        if (err instanceof NanoGptTimeoutError || (err instanceof DOMException && err.name === "AbortError")) throw err;
+        // Other errors from fail() are NanoGptApiError with status - retry if retryable
+        if (!isRetryableStatus(response.status)) throw err;
+        debug?.(`NanoGPT request failed with ${response.status}, will retry...`);
+        continue;
+      }
+    }
+
+    // Retryable status - continue to next attempt
+    debug?.(`NanoGPT request failed with ${response.status}, will retry...`);
+  }
+
+  // Exhausted all retries
+  throw new NanoGptApiError({
+    status: lastResponse?.status ?? 0,
+    message: `NanoGPT request failed after ${RETRY_CONFIG.maxRetries + 1} attempts. Please try again later.`,
+  });
     },
   };
 }
