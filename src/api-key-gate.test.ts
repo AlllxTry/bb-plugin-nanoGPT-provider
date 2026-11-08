@@ -115,6 +115,46 @@ describe("checkApiKey", () => {
 });
 
 describe("createApiKeyGate", () => {
+  it("shares concurrent checks for equivalent endpoints", async () => {
+    let complete!: (state: ApiKeyState) => void;
+    let calls = 0;
+    const gate = createApiKeyGate(() => { calls++; return new Promise((resolve) => { complete = resolve; }); });
+    const first = gate.verdict("key", null);
+    const second = gate.verdict("key", "https://api.nano-gpt.com/api/v1/");
+    await Promise.resolve();
+    expect(calls).toBe(1);
+    complete("valid");
+    await expect(Promise.all([first, second])).resolves.toEqual(["valid", "valid"]);
+  });
+
+  it("does not restore cleared trust when an old in-flight check finishes", async () => {
+    let complete!: (state: ApiKeyState) => void;
+    let calls = 0;
+    const gate = createApiKeyGate(() => {
+      calls++;
+      return calls === 1 ? new Promise((resolve) => { complete = resolve; }) : Promise.resolve("unknown");
+    });
+    const old = gate.verdict("key", null);
+    await Promise.resolve();
+    gate.clear();
+    complete("valid");
+    await expect(old).resolves.toBe("unknown");
+    await expect(gate.isUsable("key", null)).resolves.toBe(false);
+  });
+
+  it("evicts old cache and accepted identities", async () => {
+    let online = true;
+    let time = 0;
+    const gate = createApiKeyGate(async () => online ? "valid" : "unknown", () => time);
+    for (let i = 0; i < 65; i++) await gate.verdict(`key-${i}`, null);
+    online = false;
+    time = 120000;
+    await expect(gate.isUsable("key-0", null)).resolves.toBe(false);
+    await expect(gate.isUsable("key-64", null)).resolves.toBe(true);
+    gate.clear();
+    await expect(gate.isUsable("key-64", null)).resolves.toBe(false);
+  });
+
   it("only lets an accepted key through and caches the verdict", async () => {
     let calls = 0;
     const gate = createApiKeyGate(async ({ apiKey }) => {

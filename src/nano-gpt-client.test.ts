@@ -1,10 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   NanoGptApiError,
+  MODEL_LIST_TIMEOUT_MS,
+  STREAM_IDLE_TIMEOUT_MS,
   createNanoGptClient,
   type NanoGptStreamEvent,
 } from "./nano-gpt-client.js";
 import { NANO_GPT_DEFAULT_BASE_URL } from "./vocabulary.js";
+
+afterEach(() => vi.useRealTimers());
 
 function sseResponse(body: string, status = 200): Response {
   const stream = new ReadableStream<Uint8Array>({
@@ -41,6 +45,153 @@ async function collect(
 }
 
 describe("streamChatCompletion", () => {
+  it.each([" ", "a\nb", "a".repeat(513)])("rejects invalid model IDs before fetch", async (model) => {
+    const fetch = vi.fn();
+    const client = createNanoGptClient({ apiKey: "test", fetch });
+    await expect(collect(client.streamChatCompletion({ model, messages: [] }))).rejects.toThrow(/Model ID must/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each(["headers", "body", "error body"])("times out stalled completion %s", async (stage) => {
+    vi.useFakeTimers();
+    const client = createNanoGptClient({ apiKey: "test", fetch: async () => {
+      if (stage === "headers") return new Promise<Response>(() => undefined);
+      return new Response(new ReadableStream<Uint8Array>({ start() {} }), { status: stage === "error body" ? 503 : 200 });
+    } });
+    const promise = collect(client.streamChatCompletion({ model: "test", messages: [] }));
+    const assertion = expect(promise).rejects.toMatchObject({ name: "NanoGptTimeoutError" });
+    await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS);
+    await assertion;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("resets idle deadlines per read and does not time out while the consumer is paused", async () => {
+    vi.useFakeTimers();
+    let writer!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({ start(controller) { writer = controller; } });
+    const client = createNanoGptClient({ apiKey: "test", fetch: async () => new Response(stream) });
+    const iterator = client.streamChatCompletion({ model: "test", messages: [] });
+    const first = iterator.next();
+    await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS - 1);
+    writer.enqueue(new TextEncoder().encode(chunk({ choices: [{ delta: { content: "first" } }] })));
+    await expect(first).resolves.toMatchObject({ value: { type: "textDelta", text: "first" } });
+    await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS * 2);
+    const second = iterator.next();
+    await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS - 1);
+    writer.enqueue(new TextEncoder().encode(chunk({ choices: [{ delta: { content: "second" }, finish_reason: "stop" }] })));
+    await expect(second).resolves.toMatchObject({ value: { type: "textDelta", text: "second" } });
+    writer.close();
+    await iterator.next();
+    await iterator.return(undefined);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    {
+      name: "parallel calls identified only by id",
+      fragments: [
+        { id: "a", function: { name: "first", arguments: '{"a":' } },
+        { id: "b", function: { name: "second", arguments: '{"b":2}' } },
+        { id: "a", function: { arguments: "1}" } },
+      ],
+      expected: [
+        { id: "a", function: { name: "first", arguments: '{"a":1}' } },
+        { id: "b", function: { name: "second", arguments: '{"b":2}' } },
+      ],
+    },
+    {
+      name: "mixed indexed and id-only calls without index collisions",
+      fragments: [
+        { id: "a", function: { name: "first", arguments: '{"a":' } },
+        { index: 0, id: "b", function: { name: "second", arguments: '{"b":' } },
+        { id: "a", function: { arguments: "1}" } },
+        { index: 0, function: { arguments: "2}" } },
+      ],
+      expected: [
+        { id: "b", function: { name: "second", arguments: '{"b":2}' } },
+        { id: "a", function: { name: "first", arguments: '{"a":1}' } },
+      ],
+    },
+    {
+      name: "an indexed call continued by id",
+      fragments: [
+        { index: 2, id: "a", function: { name: "first", arguments: '{"a":' } },
+        { id: "a", function: { arguments: "1}" } },
+      ],
+      expected: [{ id: "a", function: { name: "first", arguments: '{"a":1}' } }],
+    },
+  ])("keeps $name separate", async ({ fragments, expected }) => {
+    const client = createNanoGptClient({
+      apiKey: "sk-nano-test",
+      fetch: async () => sseResponse([
+        ...fragments.map((fragment) => chunk({ choices: [{ delta: { tool_calls: [fragment] } }] })),
+        chunk({ choices: [{ delta: {}, finish_reason: "tool_calls" }] }),
+      ].join("")),
+    });
+    const events = await collect(client.streamChatCompletion({ model: "test", messages: [] }));
+    expect(events.at(-1)).toMatchObject({ type: "message", toolCalls: expected });
+  });
+
+  it.each([
+    { name: "ambiguous", fragments: [
+      { id: "a", function: { name: "first", arguments: "{" } },
+      { id: "b", function: { name: "second", arguments: "{" } },
+      { function: { arguments: "}" } },
+    ], error: /Ambiguous tool-call/ },
+    { name: "conflicting", fragments: [
+      { index: 0, id: "a", function: { name: "first", arguments: "{}" } },
+      { index: 1, id: "b", function: { name: "second", arguments: "{}" } },
+      { index: 0, id: "b", function: { arguments: "{}" } },
+    ], error: /Conflicting tool-call/ },
+  ])("rejects $name tool-call identities", async ({ fragments, error }) => {
+    const client = createNanoGptClient({ apiKey: "sk-nano-test", fetch: async () => sseResponse([
+      ...fragments.map((fragment) => chunk({ choices: [{ delta: { tool_calls: [fragment] } }] })),
+      "data: [DONE]\n\n",
+    ].join("")) });
+    await expect(collect(client.streamChatCompletion({ model: "test", messages: [] }))).rejects.toThrow(error);
+  });
+
+  it.each([false, true])("surfaces an SSE error with partial text: %s", async (partial) => {
+    const client = createNanoGptClient({ apiKey: "sk-nano-test", fetch: async () => sseResponse([
+      ...(partial ? [chunk({ choices: [{ delta: { content: "partial" } }] })] : []),
+      chunk({ error: { message: "insufficient balance", code: "no_balance" } }),
+      "data: [DONE]\n\n",
+    ].join("")) });
+    const events: NanoGptStreamEvent[] = [];
+    await expect((async () => {
+      for await (const event of client.streamChatCompletion({ model: "test", messages: [] })) events.push(event);
+    })()).rejects.toThrow("insufficient balance");
+    expect(events).toEqual(partial ? [{ type: "textDelta", text: "partial" }] : []);
+  });
+
+  it("ignores null argument fragments between tool-call chunks", async () => {
+    const client = createNanoGptClient({
+      apiKey: "sk-nano-test",
+      fetch: async () => sseResponse([
+        chunk({ choices: [{ delta: { tool_calls: [{
+          index: 0, id: "call_1",
+          function: { name: "read_file", arguments: '{"pa' },
+        }] } }] }),
+        chunk({ choices: [{ delta: { tool_calls: [{
+          index: 0, function: { arguments: null },
+        }] } }] }),
+        chunk({ choices: [{ delta: { tool_calls: [{
+          index: 0, function: { arguments: 'th":"a"}' },
+        }] }, finish_reason: "tool_calls" }] }),
+        "data: [DONE]\n\n",
+      ].join("")),
+    });
+    const events = await collect(client.streamChatCompletion({
+      model: "test", messages: [{ role: "user", content: "read a" }],
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: "message",
+      toolCalls: [{ id: "call_1", function: {
+        name: "read_file", arguments: '{"path":"a"}',
+      } }],
+    });
+  });
+
   it("streams text, reasoning, tool calls, and usage", async () => {
     const calls: { url: string; init: RequestInit }[] = [];
     const client = createNanoGptClient({
@@ -315,6 +466,18 @@ describe("streamChatCompletion", () => {
 });
 
 describe("listModels", () => {
+  it.each(["headers", "JSON body", "error body"])("bounds stalled model-list %s", async (stage) => {
+    vi.useFakeTimers();
+    const client = createNanoGptClient({ apiKey: "test", fetch: async () => {
+      if (stage === "headers") return new Promise<Response>(() => undefined);
+      return new Response(new ReadableStream<Uint8Array>({ start() {} }), { status: stage === "error body" ? 503 : 200 });
+    } });
+    const assertion = expect(client.listModels()).rejects.toMatchObject({ name: "NanoGptTimeoutError" });
+    await vi.advanceTimersByTimeAsync(MODEL_LIST_TIMEOUT_MS);
+    await assertion;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("returns model ids from the OpenAI-style list", async () => {
     const client = createNanoGptClient({
       apiKey: "sk-nano-test",

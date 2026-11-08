@@ -1,19 +1,26 @@
 import type { PluginProviderFallbackModel } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
-export const NANO_GPT_PLUGIN_ID = "nanogpt-provider";
-
 import { NANO_GPT_PROVIDER_ID } from "./provider-id.js";
 
 export { NANO_GPT_PROVIDER_ID };
 
-export const NANO_GPT_DEFAULT_BASE_URL = "https://api.nano-gpt.com/api/v1";
+export { NANO_GPT_DEFAULT_BASE_URL } from "./base-url.js";
 
 export const NANO_GPT_API_KEY_ENV = "NANOGPT_API_KEY";
 
 export const NANO_GPT_BASE_URL_ENV = "NANOGPT_BASE_URL";
 
 export const NANO_GPT_DEFAULT_MODEL_ID = "openai/gpt-6.1-sol";
+
+export const nanoGptModelIdSchema = z.string().trim().min(1).max(512)
+  .refine((value) => !/[\u0000-\u001f\u007f]/u.test(value));
+
+export function normalizeModelId(value: unknown): string {
+  const parsed = nanoGptModelIdSchema.safeParse(value);
+  if (!parsed.success) throw new Error("Model ID must be non-empty, at most 512 characters, and contain no control characters.");
+  return parsed.data;
+}
 
 function fallbackModel(
   id: string,
@@ -26,7 +33,7 @@ function fallbackModel(
     displayName,
     description,
     supportedReasoningEfforts: [
-      { reasoningEffort: "medium", description: "Default" },
+      { reasoningEffort: "medium", label: "Provider default", description: "Use the upstream model's default reasoning." },
     ],
     defaultReasoningEffort: "medium",
     isDefault,
@@ -55,7 +62,7 @@ export const NANO_GPT_FALLBACK_MODELS: readonly PluginProviderFallbackModel[] = 
 ];
 
 export const nanoGptProviderOptionsSchema = z.object({
-  model: z.string(),
+  model: nanoGptModelIdSchema,
   baseUrl: z.string().url().nullable(),
   promptMode: z.enum(["plan"]).nullable(),
 });

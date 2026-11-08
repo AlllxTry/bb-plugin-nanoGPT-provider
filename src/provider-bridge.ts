@@ -28,8 +28,10 @@ import {
   turnSteerParamsSchema,
 } from "@get-bb/plugin-sdk/provider-bridge";
 import { randomUUID } from "node:crypto";
-import { describeAttachedFile } from "./attachments.js";
 import { z } from "zod";
+import { describeAttachedFile, readAttachedImage, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES } from "./attachments.js";
+import { normalizeBaseUrl } from "./base-url.js";
+import { boundedHistoryText, estimateTextTokens, fitContext } from "./context.js";
 import {
   type NanoGptContentPart,
   type NanoGptMessage,
@@ -47,12 +49,12 @@ import {
   NANO_GPT_FALLBACK_MODELS,
   modelDisplayName,
   nanoGptProviderOptionsSchema,
+  normalizeModelId,
 } from "./vocabulary.js";
 
 const instanceNonce = randomUUID().replaceAll("-", "").slice(0, 12);
 let threadCounter = 0;
 let outboundRequestCounter = 0;
-const MAX_MODEL_LIST = 400;
 const STOP_SETTLE_TIMEOUT_MS = 2000;
 
 interface QueuedPrompt {
@@ -69,6 +71,7 @@ interface Session {
   cwd: string;
   tools: ReadonlyMap<string, DynamicTool>;
   messages: NanoGptMessage[];
+  completedTurnEnds: number[];
   turnCounter: number;
   usageTotal: ThreadEventTokenUsageBreakdown;
   activeTurn: ActiveTurn | null;
@@ -90,6 +93,7 @@ interface ActiveTurn {
   reasoningKey: string | null;
   messageKey: string | null;
   messageText: string;
+  historyStart: number | null;
   openTools: Map<string, OpenTool>;
   /** Tool-call ids the model issued that have no answer in the history yet. */
   unansweredToolCalls: string[];
@@ -140,11 +144,8 @@ function baseUrl(
   providerOptions: unknown,
   envVars?: Record<string, string>,
 ): string {
-  const parsed = nanoGptProviderOptionsSchema.safeParse(providerOptions);
-  if (parsed.success && parsed.data.baseUrl !== null) {
-    return parsed.data.baseUrl;
-  }
-  return (
+  const parsed = nanoGptProviderOptionsSchema.pick({ baseUrl: true }).partial().parse(providerOptions ?? {});
+  return normalizeBaseUrl(parsed.baseUrl ??
     envVars?.[NANO_GPT_BASE_URL_ENV] ??
     process.env[NANO_GPT_BASE_URL_ENV] ??
     NANO_GPT_DEFAULT_BASE_URL
@@ -154,7 +155,7 @@ function baseUrl(
 function modelId(options: TurnOptions): string {
   const parsed = nanoGptProviderOptionsSchema.safeParse(options.providerOptions);
   if (options.model !== undefined && options.model !== "") {
-    return options.model;
+    return normalizeModelId(options.model);
   }
   if (parsed.success && parsed.data.model !== "") {
     return parsed.data.model;
@@ -168,6 +169,14 @@ function openSession(args: {
   cwd: string;
   dynamicTools: readonly DynamicTool[] | undefined;
 }): Session {
+  const previous = sessions.get(args.threadId);
+  if (previous !== undefined) {
+    previous.queue.length = 0;
+    if (previous.activeTurn !== null) {
+      previous.activeTurn.settled = true;
+      previous.activeTurn.controller.abort();
+    }
+  }
   const session: Session = {
     threadId: args.threadId,
     providerThreadId: args.providerThreadId,
@@ -176,6 +185,7 @@ function openSession(args: {
       (args.dynamicTools ?? []).map((tool) => [tool.name, tool]),
     ),
     messages: [],
+    completedTurnEnds: [],
     turnCounter: 0,
     usageTotal: ZERO_TOKEN_USAGE,
     activeTurn: null,
@@ -199,24 +209,35 @@ function itemId(session: Session, name: string, round: number): string {
   return `nano-gpt-${session.providerThreadId}-t${session.turnCounter}-r${round}-${name}`;
 }
 
-function userContent(input: readonly PromptInput[]): string | NanoGptContentPart[] {
+async function userContent(input: readonly PromptInput[], signal: AbortSignal): Promise<string | NanoGptContentPart[]> {
   const parts: NanoGptContentPart[] = [];
+  let imageBytes = 0;
   for (const item of input) {
+    signal.throwIfAborted();
     if (item.type === "text") {
       parts.push({ type: "text", text: item.text });
       continue;
     }
     if (item.type === "image") {
+      if (item.url.startsWith("data:")) {
+        const size = Buffer.byteLength(item.url);
+        if (size > Math.ceil(MAX_IMAGE_BYTES * 4 / 3) + 100) throw new Error("Attached image exceeds the image size limit.");
+        imageBytes += Math.ceil(size * 3 / 4);
+      }
+      if (imageBytes > MAX_TOTAL_IMAGE_BYTES) throw new Error("Attached images exceed the combined image size limit.");
       parts.push({ type: "image_url", image_url: { url: item.url } });
       continue;
     }
     if (item.type === "localImage") {
-      parts.push({ type: "text", text: `[local image: ${item.path}]` });
+      const image = await readAttachedImage(item, signal);
+      imageBytes += image.byteLength;
+      if (imageBytes > MAX_TOTAL_IMAGE_BYTES) throw new Error("Attached images exceed the combined image size limit.");
+      parts.push({ type: "image_url", image_url: { url: image.url } });
       continue;
     }
     parts.push({
       type: "text",
-      text: describeAttachedFile(item),
+      text: await describeAttachedFile(item, signal),
     });
   }
   if (parts.every((part) => part.type === "text")) {
@@ -227,10 +248,11 @@ function userContent(input: readonly PromptInput[]): string | NanoGptContentPart
   return parts;
 }
 
-function setSystemMessage(session: Session, options: TurnOptions): void {
+function setSystemMessage(session: Session, options: TurnOptions, planMode: boolean): void {
   const text = [
     options.instructions ?? "",
     `Working directory: ${session.cwd}`,
+    ...(planMode ? ["Plan mode: outline a plan only. Do not execute tools or claim to have performed actions. Ask the user to switch out of plan mode to carry out the plan."] : []),
   ]
     .filter((line) => line !== "")
     .join("\n\n");
@@ -301,6 +323,12 @@ function requestToolCall(
   if (signal.aborted) {
     return Promise.resolve(CANCELLED_TOOL_REPLY);
   }
+  if (!session.tools.has(tool)) {
+    return Promise.resolve({
+      content: `Error: unknown tool "${tool}". The tool was not run. Use only the tools provided for this session.`,
+      isError: true,
+    });
+  }
   const requestId = sendRequest(BRIDGE_INBOUND_REQUEST_METHODS.toolCall, {
     providerThreadId: session.providerThreadId,
     threadId: session.threadId,
@@ -326,17 +354,12 @@ function requestToolCall(
   });
 }
 
-function estimatedUsage(messages: readonly NanoGptMessage[]): ThreadEventTokenUsageBreakdown {
-  const chars = messages
-    .map((message) =>
-      typeof message.content === "string" ? message.content.length : 0,
-    )
-    .reduce((sum, value) => sum + value, 0);
+function estimatedUsage(inputTokens: number, outputTokens: number): ThreadEventTokenUsageBreakdown {
   return {
     ...ZERO_TOKEN_USAGE,
-    inputTokens: Math.ceil(chars / 4),
-    outputTokens: 0,
-    totalTokens: Math.ceil(chars / 4),
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
   };
 }
 
@@ -352,6 +375,7 @@ function newActiveTurn(): ActiveTurn {
     reasoningKey: null,
     messageKey: null,
     messageText: "",
+    historyStart: null,
     openTools: new Map(),
     unansweredToolCalls: [],
   };
@@ -384,7 +408,6 @@ function settleTurn(
       kind: "item.textClose",
       key: { providerItemId: turn.reasoningKey },
       channel: "reasoningText",
-      text: "",
     });
     turn.reasoningKey = null;
   }
@@ -422,6 +445,9 @@ function settleTurn(
     });
   }
   turn.unansweredToolCalls = [];
+  if (turn.historyStart !== null && session.messages.length > turn.historyStart) {
+    session.completedTurnEnds.push(session.messages.length);
+  }
   if (outcome.status === "completed") {
     session.usageTotal = addTokenUsage(session.usageTotal, outcome.usage);
     deltas.push(
@@ -479,7 +505,7 @@ function runTurn(args: {
       });
     })
     .finally(() => {
-      if (session.activeTurn === activeTurn) {
+      if (session.activeTurn === activeTurn && sessions.get(session.threadId) === session) {
         session.activeTurn = null;
         drainQueue(session);
       }
@@ -520,7 +546,6 @@ function closeRoundText(
       kind: "item.textClose",
       key: { providerItemId: turn.reasoningKey },
       channel: "reasoningText",
-      text: "",
     });
   }
   if (turn.messageKey !== null) {
@@ -557,7 +582,7 @@ async function runTurnWork(
   // Nothing may be emitted once the turn has settled (for example after a
   // stop): the terminal boundary has already been sent.
   const emit = (deltas: ThreadDelta[]): void => {
-    if (!turn.settled) {
+    if (!turn.settled && sessions.get(threadId) === session) {
       emitDeltas(threadId, deltas);
     }
   };
@@ -579,18 +604,26 @@ async function runTurnWork(
     return;
   }
 
-  const model = modelId(args.options);
-  setSystemMessage(session, args.options);
-  session.messages.push({ role: "user", content: userContent(args.input) });
-  const client = createNanoGptClient({
-    baseUrl: baseUrl(args.options.providerOptions, args.options.envVars),
-    apiKey: key,
-  });
-  const tools = toolDefinitions(session);
+  let historyMark = session.messages.length;
+  let hasModelProgress = false;
   // Usage is summed over every model round of the turn.
   let turnUsage: ThreadEventTokenUsageBreakdown = ZERO_TOKEN_USAGE;
 
   try {
+    const model = modelId(args.options);
+    const providerOptions = nanoGptProviderOptionsSchema.partial().parse(args.options.providerOptions);
+    const planMode = providerOptions.promptMode === "plan";
+    setSystemMessage(session, args.options, planMode);
+    historyMark = session.messages.length;
+    turn.historyStart = historyMark;
+    const content = await userContent(args.input, signal);
+    if (turn.settled || signal.aborted) throw abortError();
+    session.messages.push({ role: "user", content });
+    const client = createNanoGptClient({
+      baseUrl: baseUrl(args.options.providerOptions, args.options.envVars),
+      apiKey: key,
+    });
+    const tools = planMode ? [] : toolDefinitions(session);
     let rounds = 0;
     while (true) {
       rounds += 1;
@@ -600,7 +633,16 @@ async function runTurnWork(
           message: `Stopped after ${MAX_TOOL_ROUNDS} tool rounds without a final answer.`,
         });
       }
-      const roundEstimate = estimatedUsage(session.messages);
+      const context = fitContext(session.messages, session.completedTurnEnds, historyMark, tools);
+      historyMark = context.currentStart;
+      turn.historyStart = historyMark;
+      if (context.removedTurns > 0) {
+        const key = { providerItemId: itemId(session, "context-notice", rounds) };
+        emit([
+          { kind: "item.open", key, item: { type: "agentMessage", text: "" } },
+          { kind: "item.textClose", key, channel: "agentMessage", text: `Older conversation context was removed to fit the local token budget (${context.removedTurns} turn(s)). The visible conversation is unchanged.` },
+        ]);
+      }
 
       const stream = client.streamChatCompletion({
         model,
@@ -614,6 +656,7 @@ async function runTurnWork(
       let finalToolCalls: NanoGptToolCall[] = [];
       let finalUsage: ThreadEventTokenUsageBreakdown | null = null;
       let finishReason: string | null = null;
+      let reasoningTokens = 0;
 
       for await (const event of stream) {
         if (turn.settled) {
@@ -642,6 +685,7 @@ async function runTurnWork(
           continue;
         }
         if (event.type === "reasoningDelta") {
+          reasoningTokens += estimateTextTokens(event.text);
           if (turn.reasoningKey === null) {
             turn.reasoningKey = itemId(session, "reasoning", rounds);
           }
@@ -676,33 +720,42 @@ async function runTurnWork(
           message: "NanoGPT stream ended without a final message.",
         });
       }
+      if (finalContent !== "") {
+        hasModelProgress = true;
+      }
       closeRoundText(session, turn, finalContent);
-      turnUsage = addTokenUsage(turnUsage, finalUsage ?? roundEstimate);
+      const outputTokens = estimateTextTokens(finalContent) + reasoningTokens + (finalToolCalls.length === 0 ? 0 : estimateTextTokens(JSON.stringify(finalToolCalls)));
+      turnUsage = addTokenUsage(turnUsage, finalUsage ?? estimatedUsage(context.inputTokens, outputTokens));
 
-      if (finishReason === "length") {
+      if (finishReason === "length" || finishReason === "content_filter" || (planMode && finalToolCalls.length > 0)) {
         // The model hit its output limit: the text, and any tool-call
         // arguments, are cut off. Keep what the user saw, but never present
         // it as a finished answer and never run a half-written tool call.
         if (finalContent !== "") {
-          session.messages.push({ role: "assistant", content: finalContent });
+          session.messages.push({ role: "assistant", content: boundedHistoryText(finalContent) });
         }
         throw new NanoGptApiError({
           status: 0,
           message:
-            "The model stopped because it reached its output length limit, so the answer is incomplete. Ask it to continue, or choose a model with a larger output limit.",
+            finishReason === "content_filter"
+              ? "The provider blocked this response. No tool calls from this response were run."
+              : planMode && finalToolCalls.length > 0
+                ? "The model returned a tool call in plan mode. No tools were run. Switch out of plan mode to execute actions."
+                : "The model stopped because it reached its output length limit, so the answer is incomplete. Ask it to continue, or choose a model with a larger output limit.",
         });
       }
 
       if (finalToolCalls.length === 0) {
-        session.messages.push({ role: "assistant", content: finalContent });
+        session.messages.push({ role: "assistant", content: boundedHistoryText(finalContent) });
         break;
       }
 
       session.messages.push({
         role: "assistant",
-        content: finalContent === "" ? null : finalContent,
+        content: finalContent === "" ? null : boundedHistoryText(finalContent),
         tool_calls: finalToolCalls,
       });
+      hasModelProgress = true;
       turn.unansweredToolCalls = finalToolCalls.map((call) => call.id);
       const markAnswered = (id: string): void => {
         turn.unansweredToolCalls = turn.unansweredToolCalls.filter(
@@ -778,7 +831,7 @@ async function runTurnWork(
           toolArgs,
           signal,
         );
-        if (signal.aborted || turn.settled || !sessions.has(threadId)) {
+        if (signal.aborted || turn.settled || sessions.get(threadId) !== session) {
           // Left in openTools and unansweredToolCalls on purpose: settleTurn
           // closes the item as interrupted and answers the call in history.
           throw abortError();
@@ -804,7 +857,7 @@ async function runTurnWork(
         session.messages.push({
           role: "tool",
           tool_call_id: call.id,
-          content: reply.content === "" ? "OK" : reply.content,
+          content: boundedHistoryText(reply.content === "" ? "OK" : reply.content),
         });
         markAnswered(call.id);
       }
@@ -812,6 +865,11 @@ async function runTurnWork(
 
     settleTurn(session, turn, { status: "completed", usage: turnUsage });
   } catch (error) {
+    if (turn.settled) return;
+    if (turn.messageText !== "") {
+      session.messages.push({ role: "assistant", content: boundedHistoryText(turn.messageText) });
+      hasModelProgress = true;
+    }
     const aborted =
       signal.aborted ||
       (error instanceof Error && error.name === "AbortError");
@@ -819,9 +877,12 @@ async function runTurnWork(
       settleTurn(session, turn, { status: "interrupted" });
       return;
     }
+    const discardedInput = !hasModelProgress;
+    if (discardedInput) session.messages.length = historyMark;
+    const detail = error instanceof Error ? error.message : String(error);
     settleTurn(session, turn, {
       status: "failed",
-      message: error instanceof Error ? error.message : String(error),
+      message: detail + (discardedInput ? " This input was not kept in the model history; revise it and try again." : ""),
     });
   }
 }
@@ -839,15 +900,15 @@ function invalidParams(id: JsonRpcId, method: string, issues: unknown): void {
 }
 
 function healthResult(): ProviderHealthResult {
-  const key = (process.env[NANO_GPT_API_KEY_ENV] ?? "").trim();
+  // Maintenance requests carry no current credentials. bb overlays this
+  // baseline with the server's experimental_contributeEnvHealth result.
+  // Reading process.env here would report stale authentication after key edits.
   return {
     supported: true,
     health: {
-      status: key === "" ? "unauthenticated" : "ready",
+      status: "unauthenticated",
       statusMessage:
-        key === ""
-          ? "Paste your NanoGPT API key into the NanoGPT provider plugin settings to use NanoGPT."
-          : null,
+        "Paste your NanoGPT API key into the NanoGPT provider plugin settings to use NanoGPT.",
       accountEmail: null,
       planLabel: null,
       installedVersion: null,
@@ -885,7 +946,7 @@ const handlers: Record<string, RequestHandler> = {
     io.sendResult(id, {
       protocolVersion: PROVIDER_BRIDGE_PROTOCOL_VERSION,
       capabilities: {
-        grammarVersions: [THREAD_DELTA_GRAMMAR_V3, THREAD_DELTA_GRAMMAR_V3],
+        grammarVersions: [THREAD_DELTA_GRAMMAR_V3],
         // The bridge keeps conversation history in memory only, so it cannot
         // restore a session after a restart. Do not claim otherwise.
         sessionRestore: false,
@@ -916,28 +977,24 @@ const handlers: Record<string, RequestHandler> = {
           baseUrl: baseUrl(undefined, parsed.data.envVars),
           apiKey: key,
         }).listModels();
-        const preferred = new Set(
-          NANO_GPT_FALLBACK_MODELS.map((model) => model.id),
+        const preferred = new Map(
+          NANO_GPT_FALLBACK_MODELS.map((model, index) => [model.id, index]),
         );
         const unique = [...new Set(ids)];
         unique.sort((left, right) => {
-          const leftPreferred = preferred.has(left) ? 1 : 0;
-          const rightPreferred = preferred.has(right) ? 1 : 0;
-          if (leftPreferred !== rightPreferred) {
-            return rightPreferred - leftPreferred;
-          }
-          return left.localeCompare(right);
+          return ((preferred.get(left) ?? Infinity) - (preferred.get(right) ?? Infinity)) || left.localeCompare(right);
         });
-        const models = unique.slice(0, MAX_MODEL_LIST).map((modelId, index) => ({
+        const defaultId = unique.includes(NANO_GPT_DEFAULT_MODEL_ID) ? NANO_GPT_DEFAULT_MODEL_ID : unique[0];
+        const models = unique.map((modelId) => ({
           id: modelId,
           model: modelId,
           displayName: modelDisplayName(modelId),
           description: "Chat model routed through NanoGPT.",
           supportedReasoningEfforts: [
-            { reasoningEffort: "medium", description: "Default" },
+            { reasoningEffort: "medium", label: "Provider default", description: "Use the upstream model's default reasoning." },
           ],
           defaultReasoningEffort: "medium",
-          isDefault: index === 0,
+          isDefault: modelId === defaultId,
         }));
         io.sendResult(id, { models, selectedOnlyModels: [] });
       } catch {
@@ -1077,17 +1134,27 @@ const handlers: Record<string, RequestHandler> = {
     }
     session.queue.length = 0;
     const activeTurn = session.activeTurn;
-    if (parsed.data.intent === "interrupt" && activeTurn !== null) {
+    if (parsed.data.intent === "interrupt") {
+      if (activeTurn === null) {
+        io.sendResult(id, {});
+        return;
+      }
       activeTurn.controller.abort();
+      let timer: ReturnType<typeof setTimeout>;
       const timeout = new Promise<void>((resolve) => {
-        setTimeout(resolve, STOP_SETTLE_TIMEOUT_MS).unref?.();
+        timer = setTimeout(resolve, STOP_SETTLE_TIMEOUT_MS);
+        timer.unref?.();
       });
       void Promise.race([activeTurn.done, timeout]).then(() => {
+        clearTimeout(timer);
         // If the turn did not settle in time (for example a hung request),
         // settle it here so an interrupt always ends in an interrupted
         // boundary. This is a no-op when the turn already settled.
         settleTurn(session, activeTurn, { status: "interrupted" });
-        sessions.delete(parsed.data.threadId);
+        if (sessions.get(session.threadId) === session && session.activeTurn === activeTurn) {
+          session.activeTurn = null;
+          drainQueue(session);
+        }
         io.sendResult(id, {});
       });
       return;
@@ -1118,10 +1185,14 @@ function handleResponse(message: unknown): void {
   }
   const pending = pendingToolCalls.get(parsed.data.id);
   if (pending === undefined) {
+    if (process.env.NANOGPT_DEBUG_BRIDGE === "1") {
+      console.error("NanoGPT bridge: ignored a late or unmatched tool response.");
+    }
     return;
   }
   pendingToolCalls.delete(parsed.data.id);
-  if (!sessions.has(pending.session.threadId)) {
+  if (sessions.get(pending.session.threadId) !== pending.session) {
+    pending.resolve(CANCELLED_TOOL_REPLY);
     return;
   }
   if (parsed.data.error !== undefined) {

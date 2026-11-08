@@ -14,6 +14,7 @@ import type {
 } from "@get-bb/plugin-sdk/provider-bridge/testing";
 import { handleLine } from "./provider-bridge.js";
 import { NANO_GPT_API_KEY_ENV, NANO_GPT_PROVIDER_ID } from "./vocabulary.js";
+import { STREAM_IDLE_TIMEOUT_MS } from "./nano-gpt-client.js";
 
 const THREAD_ID = "thr_nano_gpt_test";
 const CWD = "/workspace/nano";
@@ -235,16 +236,338 @@ function answerToolCall(index: number): void {
 }
 
 async function startTurn(text: string, requestId: string, providerThreadId: string) {
-  await request("turn/start", {
+  const response = await request("turn/start", {
     threadId: THREAD_ID,
     providerThreadId,
     input: [{ type: "text", text, mentions: [] }],
     clientRequestId: requestId,
     options: FULL_OPTIONS,
   });
+  expect(response.error).toBeUndefined();
 }
 
 describe("the NanoGPT bridge", () => {
+  it("fails invalid model selections clearly before sending a request", async () => {
+    const providerThreadId = await startThread();
+    await request("turn/start", { threadId: THREAD_ID, providerThreadId, input: [{ type: "text", text: "hi", mentions: [] }], clientRequestId: "creq_abcdefgh22", options: { ...FULL_OPTIONS, model: " " } });
+    await waitFor(() => boundary("failed"));
+    expect(fetchCalls).toHaveLength(0);
+    expect(JSON.stringify(deltaNotifications())).toContain("Model ID must");
+  });
+
+  it("logs unmatched replies only when debug is enabled, without response data", () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      vi.stubEnv("NANOGPT_DEBUG_BRIDGE", undefined);
+      handleLine(JSON.stringify({ jsonrpc: "2.0", id: "old", result: { secret: "do-not-log" } }));
+      expect(log).not.toHaveBeenCalled();
+      vi.stubEnv("NANOGPT_DEBUG_BRIDGE", "1");
+      handleLine(JSON.stringify({ jsonrpc: "2.0", id: "old", result: { secret: "do-not-log" } }));
+      expect(log).toHaveBeenCalledWith("NanoGPT bridge: ignored a late or unmatched tool response.");
+      expect(JSON.stringify(log.mock.calls)).not.toContain("do-not-log");
+    } finally { vi.unstubAllEnvs(); log.mockRestore(); }
+  });
+
+  it("reports idle timeouts as failed rather than interrupted turns", async () => {
+    vi.useFakeTimers();
+    try {
+      responses.push(new Response(new ReadableStream<Uint8Array>({ start() {} })));
+      const providerThreadId = await startThread();
+      await startTurn("go", "creq_abcdefgh22", providerThreadId);
+      await vi.advanceTimersByTimeAsync(STREAM_IDLE_TIMEOUT_MS);
+      expect(boundary("failed")).toBe(true);
+      expect(boundary("interrupted")).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("estimates multipart input and generated output when usage is absent", async () => {
+    responses.push(answerResponse("generated output"));
+    const providerThreadId = await startThread();
+    await request("turn/start", {
+      threadId: THREAD_ID, providerThreadId, input: [{ type: "text", text: "question", mentions: [] }, { type: "image", url: "https://example.com/image.png" }],
+      clientRequestId: "creq_abcdefgh22", options: FULL_OPTIONS,
+    });
+    await waitFor(() => boundary("completed"));
+    const usage = deltaNotifications().find((delta) => (delta as { kind: string }).kind === "usage") as unknown as { last: { inputTokens: number; outputTokens: number } };
+    expect(usage.last.inputTokens).toBeGreaterThan(2048);
+    expect(usage.last.outputTokens).toBeGreaterThan(0);
+  });
+
+  it("keeps catalogs larger than 400 models", async () => {
+    const ids = Array.from({ length: 450 }, (_, index) => `model-${index}`);
+    responses.push(new Response(JSON.stringify({ data: ids.map((id) => ({ id })) })));
+    const response = await request("model/list", { envVars: FULL_OPTIONS.envVars });
+    expect((response.result as { models: unknown[] }).models).toHaveLength(450);
+  });
+
+  it("evicts old complete turns with notice as conversation context grows", async () => {
+    responses.push(answerResponse("one"), answerResponse("two"), answerResponse("three"));
+    const providerThreadId = await startThread();
+    const inputs = ["first ", "second ", "third "].map((prefix) => prefix + "a".repeat(40000));
+    for (let index = 0; index < inputs.length; index++) {
+      await startTurn(inputs[index]!, "creq_abcdefgh22", providerThreadId);
+      await waitFor(() => (deltaNotifications() as BoundaryDelta[]).filter((delta) => delta.kind === "turn.boundary").length === index + 1);
+    }
+    const messages = fetchCalls[2].body.messages as { role: string; content: string }[];
+    expect(messages[0].role).toBe("system");
+    expect(messages.some((message) => message.content === inputs[0])).toBe(false);
+    expect(messages.some((message) => message.content === inputs[1])).toBe(true);
+    expect(messages.at(-1)?.content).toBe(inputs[2]);
+    expect(JSON.stringify(deltaNotifications())).toContain("Older conversation context was removed");
+  });
+
+  it("rejects oversized input locally and accepts a revised next turn", async () => {
+    responses.push(answerResponse("recovered"));
+    const providerThreadId = await startThread();
+    await startTurn("a".repeat(100000), "creq_abcdefgh22", providerThreadId);
+    await waitFor(() => boundary("failed"));
+    expect(fetchCalls).toHaveLength(0);
+    await startTurn("small", "creq_abcdefgh23", providerThreadId);
+    await waitFor(() => boundary("completed"));
+    expect(fetchCalls[0].body.messages).toEqual([expect.objectContaining({ role: "system" }), { role: "user", content: "small" }]);
+  });
+
+  it("sends local image bytes as a MIME-qualified data URL", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "nano-image-"));
+    try {
+      const imagePath = path.join(dir, "image.png");
+      const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jk1sAAAAASUVORK5CYII=", "base64");
+      writeFileSync(imagePath, png);
+      responses.push(answerResponse("image"));
+      const providerThreadId = await startThread();
+      await request("turn/start", { threadId: THREAD_ID, providerThreadId, input: [{ type: "localImage", path: imagePath }], clientRequestId: "creq_abcdefgh22", options: FULL_OPTIONS });
+      await waitFor(() => boundary("completed"));
+      expect((fetchCalls[0].body.messages as unknown[]).at(-1)).toEqual({ role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${png.toString("base64")}` } }] });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["env", "options"])("rejects unsafe base URLs from %s without sending credentials", async (source) => {
+    const providerThreadId = await startThread();
+    const unsafe = "http://example.com/v1";
+    await request("turn/start", {
+      threadId: THREAD_ID, providerThreadId, input: [{ type: "text", text: "hi", mentions: [] }],
+      clientRequestId: "creq_abcdefgh22", options: {
+        ...FULL_OPTIONS,
+        ...(source === "env" ? { envVars: { ...FULL_OPTIONS.envVars, NANOGPT_BASE_URL: unsafe } } : { providerOptions: { baseUrl: unsafe } }),
+      },
+    });
+    await waitFor(() => boundary("failed"));
+    expect(fetchCalls).toHaveLength(0);
+  });
+
+  it.each([
+    { ids: ["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.3", "other", "openai/gpt-6.1-sol", "openai/gpt-6.1-sol"], expected: ["openai/gpt-6.1-sol", "z-ai/glm-5.3", "deepseek/deepseek-v4-flash-0731", "other"] },
+    { ids: ["other", "deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.3"], expected: ["z-ai/glm-5.3", "deepseek/deepseek-v4-flash-0731", "other"] },
+    { ids: ["z", "a"], expected: ["a", "z"] },
+  ])("ranks preferred models and chooses one default from $ids", async ({ ids, expected }) => {
+    responses.push(new Response(JSON.stringify({ data: ids.map((id) => ({ id })) })));
+    const result = await request("model/list", { envVars: FULL_OPTIONS.envVars });
+    const models = (result.result as { models: { id: string; isDefault: boolean; supportedReasoningEfforts: unknown[] }[] }).models;
+    expect(models.map((model) => model.id)).toEqual(expected);
+    expect(models.filter((model) => model.isDefault).map((model) => model.id)).toEqual([expected[0]]);
+    expect(models[0].supportedReasoningEfforts).toEqual([expect.objectContaining({ reasoningEffort: "medium", label: "Provider default" })]);
+  });
+
+  it("enforces plan mode and clears its system instruction on the next ordinary turn", async () => {
+    responses.push(answerResponse("a plan"), answerResponse("normal"));
+    const providerThreadId = await startThread();
+    const planned = await request("turn/start", {
+      threadId: THREAD_ID, providerThreadId, input: [{ type: "text", text: "plan", mentions: [] }],
+      clientRequestId: "creq_abcdefghu2", options: { ...FULL_OPTIONS, providerOptions: { promptMode: "plan" } },
+    });
+    expect(planned.error).toBeUndefined();
+    await waitFor(() => boundary("completed"));
+    expect(fetchCalls[0].body.tools).toBeUndefined();
+    expect(fetchCalls[0].body.messages).toEqual(expect.arrayContaining([expect.objectContaining({ role: "system", content: expect.stringContaining("Plan mode:") })]));
+    await startTurn("execute", "creq_abcdefghv2", providerThreadId);
+    await waitFor(() => fetchCalls.length === 2);
+    expect(fetchCalls[1].body.tools).toHaveLength(1);
+    expect((fetchCalls[1].body.messages as { content: string }[])[0].content).not.toContain("Plan mode:");
+    await waitFor(() => (deltaNotifications() as BoundaryDelta[]).filter((d) => d.status === "completed").length === 2);
+  });
+
+  it("blocks unexpected tool calls in plan mode", async () => {
+    responses.push(toolRoundResponse("blocked", '{"path":"a"}'));
+    const providerThreadId = await startThread();
+    await request("turn/start", {
+      threadId: THREAD_ID, providerThreadId, input: [{ type: "text", text: "plan", mentions: [] }],
+      clientRequestId: "creq_abcdefghw2", options: { ...FULL_OPTIONS, providerOptions: { promptMode: "plan" } },
+    });
+    await waitFor(() => boundary("failed"));
+    expect(toolCallRequests()).toHaveLength(0);
+    expect(fetchCalls).toHaveLength(1);
+    expect(deltaNotifications()).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "provider.error", message: expect.stringContaining("No tools were run") })]));
+  });
+
+  it("returns unknown-tool errors locally without forwarding them to bb", async () => {
+    responses.push(sseResponse([chunk({ choices: [{ delta: { tool_calls: [{ index: 0, id: "unknown", function: { name: "undeclared", arguments: "{}" } }] }, finish_reason: "tool_calls" }] })]), answerResponse("recovered"));
+    const providerThreadId = await startThread();
+    await startTurn("go", "creq_abcdefghx2", providerThreadId);
+    await waitFor(() => boundary("completed"));
+    expect(toolCallRequests()).toHaveLength(0);
+    expect(fetchCalls[1].body.messages).toEqual(expect.arrayContaining([{ role: "tool", tool_call_id: "unknown", content: expect.stringContaining('unknown tool "undeclared"') }]));
+  });
+
+  it("fails filtered responses without executing their tool calls", async () => {
+    responses.push(sseResponse([chunk({ choices: [{ delta: { content: "partial", tool_calls: [{ index: 0, id: "filtered", function: { name: "read_file", arguments: '{"path":"a"}' } }] }, finish_reason: "content_filter" }] })]));
+    const providerThreadId = await startThread();
+    await startTurn("go", "creq_abcdefghy2", providerThreadId);
+    await waitFor(() => boundary("failed"));
+    expect(toolCallRequests()).toHaveLength(0);
+    expect(deltaNotifications()).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "provider.error", message: expect.stringContaining("blocked this response") })]));
+  });
+
+  it.each(["completed", "failed", "interrupted"])("closes accumulated reasoning when a turn is %s", async (outcome) => {
+    const reasoning = chunk({ choices: [{ delta: { reasoning_content: "reasoning text" } }] });
+    if (outcome === "interrupted") {
+      responses.push(new Response(new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(reasoning)); } })));
+    } else {
+      responses.push(sseResponse([reasoning, outcome === "completed" ? chunk({ choices: [{ delta: { content: "answer" }, finish_reason: "stop" }] }) : chunk({ error: { message: "failure" } })]));
+    }
+    const providerThreadId = await startThread();
+    await startTurn("go", "creq_abcdefghz2", providerThreadId);
+    if (outcome === "interrupted") {
+      await waitFor(() => JSON.stringify(deltaNotifications()).includes("reasoning text"));
+      await request("thread/stop", { threadId: THREAD_ID, providerThreadId, intent: "interrupt", activeTurnId: null });
+    }
+    await waitFor(() => boundary(outcome));
+    const collector = createBridgeDeltaEventCollector(NANO_GPT_PROVIDER_ID);
+    const events = harness.messages.flatMap((message) => collector.assembleMessage(message));
+    expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "item/completed", item: expect.objectContaining({ type: "reasoning", content: ["reasoning text"] }) })]));
+  });
+
+  it("does not delete a replacement session when an earlier interrupt finishes", async () => {
+    responses.push(toolRoundResponse("old", '{"path":"a"}'), answerResponse("fresh"));
+    const oldId = await startThread();
+    await startTurn("old", "creq_abcdefghs2", oldId);
+    await waitFor(() => toolCallRequests().length === 1);
+    const stopping = request("thread/stop", {
+      threadId: THREAD_ID, providerThreadId: oldId, intent: "interrupt", activeTurnId: null,
+    });
+    const newId = await startThread();
+    await stopping;
+    await startTurn("fresh", "creq_abcdefght2", newId);
+    await waitFor(() => boundary("completed"));
+    expect(fetchCalls).toHaveLength(2);
+    expect(fetchCalls[1].body.messages).toEqual([
+      expect.objectContaining({ role: "system" }), { role: "user", content: "fresh" },
+    ]);
+  });
+
+  it("retains history after interrupting a pending tool and continues on the same thread", async () => {
+    responses.push(answerResponse("remembered"), toolRoundResponse("call_1", '{"path":"a"}'), answerResponse("continued"));
+    const providerThreadId = await startThread();
+    await startTurn("remember this", "creq_abcdefgh22", providerThreadId);
+    await waitFor(() => boundary("completed"));
+    await startTurn("read a", "creq_abcdefgh32", providerThreadId);
+    await waitFor(() => toolCallRequests().length === 1);
+    await request("thread/stop", { threadId: THREAD_ID, providerThreadId, intent: "interrupt", activeTurnId: null });
+    await startTurn("continue", "creq_abcdefgh42", providerThreadId);
+    await waitFor(() => fetchCalls.length === 3);
+    expect(fetchCalls[2].body.messages).toEqual(expect.arrayContaining([
+      { role: "user", content: "remember this" },
+      { role: "assistant", content: "remembered" },
+      { role: "tool", tool_call_id: "call_1", content: "Tool call cancelled." },
+      { role: "user", content: "continue" },
+    ]));
+    await waitFor(() => (deltaNotifications() as BoundaryDelta[]).filter((d) => d.status === "completed").length === 2);
+  });
+
+  it("keeps idle sessions on repeated interrupts but releases them on release", async () => {
+    const providerThreadId = await startThread();
+    for (let i = 0; i < 2; i++) {
+      await request("thread/stop", { threadId: THREAD_ID, providerThreadId, intent: "interrupt", activeTurnId: null });
+    }
+    responses.push(answerResponse("still here"));
+    const continued = await request("turn/start", {
+      threadId: THREAD_ID, providerThreadId, input: [{ type: "text", text: "hi", mentions: [] }],
+      clientRequestId: "creq_abcdefgh52", options: FULL_OPTIONS,
+    });
+    expect(continued.error).toBeUndefined();
+    await waitFor(() => boundary("completed"));
+    await request("thread/stop", { threadId: THREAD_ID, providerThreadId, intent: "release", activeTurnId: null });
+    const released = await request("turn/start", {
+      threadId: THREAD_ID, providerThreadId, input: [{ type: "text", text: "hi", mentions: [] }],
+      clientRequestId: "creq_abcdefgh62", options: FULL_OPTIONS,
+    });
+    expect(released.error).toBeDefined();
+  });
+
+  it("discards rejected input before retrying without losing prior history", async () => {
+    responses.push(answerResponse("earlier answer"), new Response(JSON.stringify({ error: { message: "context_length_exceeded" } }), { status: 400 }), answerResponse("recovered"));
+    const providerThreadId = await startThread();
+    await startTurn("earlier input", "creq_abcdefgh72", providerThreadId);
+    await waitFor(() => boundary("completed"));
+    await startTurn("poisoned input", "creq_abcdefgh82", providerThreadId);
+    await waitFor(() => boundary("failed"));
+    expect(deltaNotifications()).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "provider.error", message: expect.stringContaining("not kept") })]));
+    await startTurn("revised input", "creq_abcdefgh92", providerThreadId);
+    await waitFor(() => fetchCalls.length === 3);
+    expect(fetchCalls[2].body.messages).toEqual([
+      expect.objectContaining({ role: "system" }),
+      { role: "user", content: "earlier input" }, { role: "assistant", content: "earlier answer" },
+      { role: "user", content: "revised input" },
+    ]);
+    await waitFor(() => (deltaNotifications() as BoundaryDelta[]).filter((d) => d.status === "completed").length === 2);
+  });
+
+  it("preserves executed tools when a later API round fails", async () => {
+    responses.push(toolRoundResponse("executed", '{"path":"a"}'), new Response("bad subsequent round", { status: 400 }), answerResponse("recovered"));
+    const providerThreadId = await startThread();
+    await startTurn("read a", "creq_abcdefgha2", providerThreadId);
+    await waitFor(() => toolCallRequests().length === 1);
+    answerToolCall(0);
+    await waitFor(() => boundary("failed"));
+    await startTurn("continue", "creq_abcdefghb2", providerThreadId);
+    await waitFor(() => fetchCalls.length === 3);
+    expect(fetchCalls[2].body.messages).toEqual(expect.arrayContaining([
+      { role: "user", content: "read a" },
+      expect.objectContaining({ role: "assistant", tool_calls: [expect.objectContaining({ id: "executed" })] }),
+      { role: "tool", tool_call_id: "executed", content: "x" },
+    ]));
+    await waitFor(() => boundary("completed"));
+  });
+
+  it("preserves partial text and upstream error details after an SSE failure", async () => {
+    responses.push(sseResponse([
+      chunk({ choices: [{ delta: { content: "partial answer" } }] }),
+      chunk({ error: { message: "model overloaded" } }),
+    ]), answerResponse("recovered"));
+    const providerThreadId = await startThread();
+    await startTurn("first", "creq_abcdefghc2", providerThreadId);
+    await waitFor(() => boundary("failed"));
+    expect(deltaNotifications()).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "provider.error", message: expect.stringContaining("model overloaded") })]));
+    await startTurn("continue", "creq_abcdefghd2", providerThreadId);
+    await waitFor(() => fetchCalls.length === 2);
+    expect(fetchCalls[1].body.messages).toEqual(expect.arrayContaining([{ role: "assistant", content: "partial answer" }]));
+    await waitFor(() => boundary("completed"));
+  });
+
+  it.each(["thread/start", "thread/resume"])("cancels replaced sessions on %s without running their queued work", async (method) => {
+    responses.push(toolRoundResponse("old", '{"path":"a"}'), answerResponse("fresh"));
+    const oldId = await startThread();
+    await startTurn("old", "creq_abcdefghe2", oldId);
+    await waitFor(() => toolCallRequests().length === 1);
+    await startTurn("queued old", "creq_abcdefghf2", oldId);
+    const replacement = await request(method, {
+      threadId: THREAD_ID, providerThreadId: "replacement", cwd: CWD,
+      instructionMode: "append", dynamicTools: [TOOL_DEFINITION], options: FULL_OPTIONS,
+    });
+    const newId = (replacement.result as { providerThreadId: string }).providerThreadId;
+    const countAtReplacement = deltaMessages().length;
+    answerToolCall(0);
+    await startTurn("fresh", "creq_abcdefghg2", newId);
+    await waitFor(() => boundary("completed"));
+    expect(fetchCalls).toHaveLength(2);
+    expect(fetchCalls[1].body.messages).toEqual([
+      expect.objectContaining({ role: "system" }), { role: "user", content: "fresh" },
+    ]);
+    expect(JSON.stringify(deltaMessages().slice(countAtReplacement))).not.toContain("Tool call cancelled");
+    expect((deltaNotifications() as BoundaryDelta[]).filter((d) => d.kind === "turn.boundary")).toHaveLength(1);
+  });
+
   it("answers initialize with grammar v3 capabilities", async () => {
     const response = await request("initialize", {
       protocolVersion: 2,
@@ -254,7 +577,7 @@ describe("the NanoGPT bridge", () => {
     expect(response.result).toMatchObject({
       protocolVersion: 2,
       capabilities: {
-        grammarVersions: [3, 3],
+        grammarVersions: [3],
         sessionRestore: false,
         steerMode: "queue",
       },
@@ -465,8 +788,8 @@ describe("the NanoGPT bridge", () => {
     expect(fetchCalls).toHaveLength(0);
   });
 
-  it("reports unauthenticated health without an API key", async () => {
-    delete process.env[NANO_GPT_API_KEY_ENV];
+  it("delegates authentication to server contributions even with a stale process key", async () => {
+    process.env[NANO_GPT_API_KEY_ENV] = "stale-key";
     const response = await request("provider/health", {
       providerId: NANO_GPT_PROVIDER_ID,
     });
@@ -957,4 +1280,3 @@ describe("the NanoGPT bridge", () => {
     expect(response.error?.code).toBe(BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN);
   });
 });
-

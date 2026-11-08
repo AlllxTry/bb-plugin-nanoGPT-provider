@@ -35,13 +35,19 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
   - **tool calling** through bb's dynamic tools, with multi-round tool use
     (up to 40 rounds per turn),
   - token **usage** reporting,
-  - image URLs passed through as `image_url` parts (local images are only
-    described to the model, see [Limitations](#limitations)).
+  - image URLs and local PNG/JPEG/GIF/WebP attachments sent as `image_url` parts
+    (choose a model with vision support).
 - **Attached text files** (the paperclip or add-file button) are read by the plugin
   and sent to the model inline, up to 100000 bytes per file.
 - **Live model catalog** from `GET /models`, listed only for a key that NanoGPT
   has authenticated.
-  The default model is `openai/gpt-6.1-sol`, and the first 400 models are shown.
+  The default model is `openai/gpt-6.1-sol` when available. The complete catalog
+  is returned, with preferred models first and duplicates removed.
+- **Plan mode** through `/plan`: the model receives a planning instruction and
+  no tools. The bridge also blocks unexpected tool calls returned in that mode.
+- **Bounded conversation context**: oldest completed turns are removed with a
+  visible notice when the local input budget is exceeded; tool calls and their
+  replies stay together.
 - **API key gate**: models and credentials are unavailable until NanoGPT accepts
   the key (see [below](#how-the-api-key-gate-works)).
 - **A gear in the composer** that opens a small settings form where you paste
@@ -79,11 +85,11 @@ bb can install the plugin straight from Git. bb builds it on your machine, so yo
 need no clone and no build step:
 
 ```bash
-bb plugin install git:https://github.com/AlllxTry/bb-plugin-nanoGPT-provider.git@^0.1.3
+bb plugin install git:https://github.com/AlllxTry/bb-plugin-nanoGPT-provider.git@^0.1.4
 bb plugin update nanogpt-provider      # later, to pick up a newer release
 ```
 
-The `@^0.1.3` part follows the repository's `vX.Y.Z` release tags, so
+The `@^0.1.4` part follows the repository's `vX.Y.Z` release tags, so
 `bb plugin update` only moves to compatible releases. Then continue with the
 steps under "Then, in bb" below.
 
@@ -143,6 +149,19 @@ bb plugin reload nanogpt-provider
 | `apiKey`  | string (secret) | none    | Your NanoGPT API key. Required. NanoGPT models appear only after the key is accepted.    |
 | `baseUrl` | string          | empty   | Override the API base URL. Empty means `https://api.nano-gpt.com/api/v1`.                |
 
+Custom endpoints must use HTTPS. HTTP is accepted only for `localhost`,
+`127.0.0.1` and `[::1]`, for example `http://localhost:8080/v1`. URLs containing
+credentials, query strings or fragments are rejected. The same check applies to
+the settings form, settings changed through bb, provider options and environment
+overrides. Authenticated requests reject redirects; configure the final endpoint
+directly instead of relying on a redirect.
+
+Model IDs are trimmed and checked before a request: they must be non-empty, no
+longer than 512 characters, and contain no control characters. Validation allows
+provider-specific IDs rather than restricting models to a static allowlist. A
+syntactically valid model can still be unavailable to your account; that error
+comes from the upstream API.
+
 NanoGPT documents `https://api.nano-gpt.com/api/v1legacy` as a base URL for
 clients that fail on reasoning output. Set it as `baseUrl` if you hit that.
 
@@ -169,15 +188,108 @@ The goal: **no valid key, no models.**
 4. The bridge lists models **only** if it received a key. With no key it answers
    `model/list` with an empty list, and a turn fails with a message that points
    at the plugin settings.
-5. Verdicts are cached for 60 seconds. The cache is cleared whenever a plugin
-   setting changes, so pasting a new key takes effect right away.
+5. Valid/invalid verdicts are cached for 60 seconds; temporary unknown verdicts
+   for 5 seconds. Concurrent checks for the same normalized endpoint and key
+   share a request. The cache holds at most 64 identities indexed by SHA-256
+   digests, without storing raw keys in map/set keys. Settings changes clear
+   cached verdicts and prior trust; a successful save remembers the key just
+   verified. Late checks cannot restore credentials removed in the meantime.
 6. When NanoGPT can't be reached (verdict *unknown*), a key that was accepted
    earlier in the same session keeps working. A key that was never checked does
    not.
 
 The plugin also contributes a health message to bb: while a key is accepted, bb
 can show that it is using the key saved in the plugin settings. When no key is
-saved, the plugin marks itself as needing configuration.
+saved, the plugin marks itself as needing configuration. Maintenance requests
+do not carry current credentials in SDK 0.6.133: the bridge returns a baseline
+requiring setup, and bb overlays it with the server's credential-health
+contribution. The bridge never decides readiness from a stale process API key.
+
+If the settings status RPC fails, the gear remains available. The popup shows an
+error and a Retry action instead of staying on “Checking...”. Closing the popup
+clears the unsaved key, base URL draft and transient message; it does not change
+the saved settings.
+
+## Turn lifecycle, planning and failures
+
+Each session runs one turn at a time. A message submitted during a running turn
+waits in the queue. Stop drops the queued follow-ups and interrupts the active
+turn, closing its open timeline items and answering pending model tool calls
+with cancellation results. The in-memory session remains available for the next
+turn. Stop on an idle session is harmless; release or session replacement frees
+that conversation context.
+
+`/plan` applies only to the submitted planning turn. Its system instruction is
+rebuilt for the next turn, so a subsequent ordinary turn can use tools again.
+The bridge omits tool definitions in planning requests and refuses to execute
+any tool calls unexpectedly returned by the upstream. In ordinary turns, only
+tools registered by bb for that session can execute. Unknown names receive a
+local tool error and are never forwarded to bb.
+
+If the API rejects a request before useful model output or tool calls, the
+failed input is excluded from future model requests and the error says so.
+The visible failed message is not deleted from bb. A later failure cannot erase
+tools already executed: completed calls/results and partial answers are retained
+in model history. Streaming error payloads preserve the upstream error details.
+Length-limited and content-filtered responses fail explicitly, preserving visible
+partial text and never executing calls from the incomplete/blocked response.
+
+The model list has a 10-second deadline covering fetch and response-body parsing.
+Completion headers and individual stream reads have 120-second deadlines. The
+stream idle deadline restarts with each read and does not run while the bridge
+waits for a tool result or the consumer pauses between reads. A timeout fails the
+turn; a user Stop interrupts it. Connections and local file operations are
+cancelled on a best-effort basis, while late results cannot change a settled turn.
+
+Reasoning uses the **Provider default** option. The plugin does not expose
+low/medium/high choices that silently do nothing, nor send an unverified
+`reasoning_effort` parameter to every routed backend. Reasoning deltas are still
+streamed and their timeline item is closed with its accumulated text. In SDK
+metadata, `medium` is the required fallback identifier for the single default
+option; it does not request medium effort from the upstream.
+
+## Context and attachment limits
+
+The current catalog client retrieves IDs rather than verified model context
+limits. The bridge therefore uses a documented local policy of 32,768 estimated
+tokens, with 4,096 reserved in the budget calculation and 28,672 available for
+input. This is not a claim that every model has that window, and the reservation
+does not set an upstream output-token limit. Smaller models can still reject a
+request; there is no automatic unchanged retry or paid summarization request.
+
+Before every model round, the estimate covers system/instruction text, multipart
+text, tool definitions, tool-call arguments and tool replies. Text is estimated
+from UTF-8 bytes at roughly three bytes per token, plus per-message overhead.
+Each image uses a fixed 2,048-token allowance rather than counting its base64
+characters. These are approximate budgeting values, not a tokenizer or an
+image-resolution-based cost estimate. Usage reported by the API always takes
+precedence; fallback usage separately estimates generated text, reasoning and
+tool-call output for each round.
+
+When necessary, the bridge removes the oldest complete turns from model history,
+keeping the system message and the current turn intact. An assistant tool-call
+message is never separated from its tool replies. A visible notice explains that
+older context was excluded; the conversation displayed in bb remains intact.
+If the current turn alone exceeds the budget, it fails locally before another
+API request. Large assistant/tool outputs retained in history are bounded to
+24,000 UTF-8 bytes, keeping the beginning and end with a truncation marker.
+Visible streamed text and tool results are not replaced by that shortened copy.
+
+Text attachments are read asynchronously, up to 100,000 bytes per file. Truncation
+does not split a trailing UTF-8 character. Empty files are labelled explicitly;
+binary and unreadable files are described as unavailable. Read failures distinguish
+missing files, permissions, non-regular files, resource exhaustion and filesystem
+I/O errors without exposing the full local path in the generated description.
+Only host-supplied attachment inputs are read; a path merely mentioned in prose
+does not cause a file read.
+
+Local images are read asynchronously and encoded as data URLs. PNG, JPEG, GIF
+and WebP MIME types are identified from the bytes, with a 5,000,000-byte per-image
+limit and a 10,000,000-byte combined limit per prompt for embedded/local image
+data. Remote image URLs are forwarded without downloading them locally. Vision
+support is model-dependent: choose a vision-capable model. A rejected image
+request before useful output is removed from future model history by the same
+failed-input recovery rule.
 
 ## Architecture
 
@@ -237,6 +349,8 @@ The plugin has four parts, mirroring bb's provider plugin model:
 |-- src/
 |   |-- api-key-gate.ts        # Key validation + verdict cache
 |   |-- attachments.ts         # Reads attached text files for the model
+|   |-- base-url.ts            # Shared endpoint validation and normalization
+|   |-- context.ts             # Context budgeting, whole-turn eviction, bounded outputs
 |   |-- key-status.ts          # Frontend hook: key state from RPC + realtime
 |   |-- nano-gpt-client.ts     # HTTP client: SSE streaming, tool-call assembly, models
 |   |-- provider-bridge.ts     # Bridge: sessions, turns, tool loop, JSON-RPC
@@ -322,11 +436,20 @@ npm test
 | `server.test.ts` fails with a missing package        | Install the dev dependencies. For `better-sqlite3`, run `npm rebuild better-sqlite3`.                             |
 | Client errors on reasoning output                    | Set `baseUrl` to `https://api.nano-gpt.com/api/v1legacy`.                                                         |
 | 402 or "No balance" errors                           | Your NanoGPT account is out of balance, or the model is not in your subscription and is billed from the balance. Top it up on nano-gpt.com or pick another model. |
-| The model says it cannot read a file, or guesses     | A NanoGPT thread has no file tools in bb. Attach the file with the paperclip or add-file button: text files are sent to the model inline. Binary files and images are not readable. |
+| The model says it cannot read a file, or guesses     | Attach it with the paperclip/add-file button. Text is inlined; local PNG/JPEG/GIF/WebP images are sent to vision-capable models. Binary files are described as unavailable. |
+| "current turn exceeds the local context budget"     | Reduce the current input, attachments or instructions. Older completed turns are removed automatically when that is sufficient. |
+| "stream timed out" or no response headers in time    | The endpoint stalled. Retry the turn or check the configured endpoint. Stop remains available while requests are pending. |
+| Settings show "Unavailable"                         | Click Retry. Setup remains reachable through the gear and the composer's + menu. |
 | "reached its output length limit"                    | The model stopped because its reply hit the output limit. Ask it to continue, or pick a model with a larger limit.  |
 | "stream ended before the answer was complete"        | NanoGPT closed the connection early. Send the message again.                                                       |
 
 Plugin logs: `bb plugin logs nanogpt-provider`.
+
+For late/unmatched tool-response diagnostics, set `NANOGPT_DEBUG_BRIDGE=1` in the
+host bridge environment. Diagnostics go to stderr and contain a generic reason
+only, without tool payloads, response IDs, arguments or keys. Late responses after
+Stop/replacement are expected and remain ignored. Normal mode does not log them;
+stdout remains reserved for JSON-RPC.
 
 ## Security notes
 
@@ -343,13 +466,20 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
   images to NanoGPT, or to whatever `baseUrl` you set. It reads an attached file
   only from the path bb stages for the thread, up to 100000 bytes, and no other
   file. Review NanoGPT's privacy terms before use.
-- The key is validated against NanoGPT only, with `POST /api/check-balance`.
+- NanoGPT keys are checked with `POST /api/check-balance`; custom endpoints use
+  an authenticated models request. HTTPS/loopback policy and redirect rejection
+  apply to both key checks and model requests.
 
 ## Limitations
 
 - Conversation history lives in the bridge process only. The bridge does not
   advertise session restore, so a thread resumed after a restart starts with an
-  empty model context.
+  empty model context. Interrupting a turn preserves the session and its history;
+  releasing a thread or replacing its session discards that context.
+- Input rejected before any usable model output or tool calls is excluded from
+  subsequent requests, with an error explaining that it was not retained. Partial
+  answers and executed tool results are preserved after later failures. Errors
+  reported within an SSE stream include the upstream error message.
 - Only one turn runs per thread at a time; a second message sent while a turn
   runs is queued.
 - A stream that ends before NanoGPT signals completion fails the turn instead of
@@ -367,10 +497,9 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
   cancellation of the underlying connection is best effort and cannot be forced.
   A response that arrives after the stop is cancelled and never reaches the
   timeline. A follow-up that was queued when the turn is stopped is dropped.
-- When NanoGPT does not report token usage, the plugin estimates it from the
-  conversation text (about four characters per token), once per model round. The
-  estimate counts the whole history each round, so it can overstate usage in long
-  tool loops. Usage that NanoGPT reports is used as is.
+- Token estimates and image allowances are approximate; see the context section.
+  Usage that NanoGPT reports is used as is. The local fallback budget cannot
+  guarantee compatibility with every routed model's context window.
 - Tool calls whose arguments are not valid JSON are not run; the model gets an
   error and can retry.
 - bb gives a NanoGPT thread no file or shell tools of its own (checked in bb 0.49.0 with
@@ -382,16 +511,16 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
 - Attached text files (the paperclip or add-file button) are read by the plugin and
   sent to the model inline, up to 100000 bytes per file; a longer file is cut and
   the model is told so. Binary files and files that cannot be read are described
-  to the model as unavailable, never guessed at. Local images are still sent only
-  as a text placeholder with their path, not their pixels.
-- The reasoning-level picker (low, medium, high) is **not** forwarded to the API
-  as `reasoning_effort`, because some routed providers reject it.
+  to the model as unavailable, never guessed at. Local images are sent as data
+  URLs within the documented image limits; model vision support is required.
+- Reasoning effort is controlled by the upstream model; only Provider default
+  is offered. There are no per-model effort overrides yet.
 - Only the `full` permission mode is offered. There is no fork, archive, rename,
   manual compaction or service tier support.
-- The model list is capped at 400 entries, with a few preferred models first.
+- The complete model list is returned, with preferred models first.
 - Model descriptions are generic, and context-window sizes are not reported.
 - Mobile and web clients have not been tested.
-- Checked in a live bb (0.49.0, Windows): the plugin installs and runs, the
+- Historical v0.1.3 checks in live bb (0.49.0, Windows): the plugin installed and ran, the
   `nano-gpt` provider is registered, the gear and the settings form appear in the
   composer, a rejected key is not saved, a real key is accepted by NanoGPT, and
   the server then loads a catalog of 400 models. With no key the picker offers no
@@ -407,6 +536,9 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
   correctly. The tool-call checks used bb's own tools and a temporary slow test
   tool, so file tools were not exercised. Streaming with reasoning content was
   not seen live.
+- The v0.1.4 changes are covered by unit/integration tests, type checking
+  and a plugin build. New live bb/API smoke checks have not been run; the historical
+  checks above do not validate the new behavior against a real model.
 
 ## Support the project
 

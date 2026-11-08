@@ -16,7 +16,7 @@ function errorText(error: unknown, fallback: string): string {
 export function SettingsPopup() {
   const composer = useComposer();
   const rpc = useRpc<typeof nanoGptSettingsContract>();
-  const { status, refresh } = useKeyStatus();
+  const { status, error, refresh } = useKeyStatus();
   const [apiKey, setApiKey] = useState("");
   const [baseUrlEdit, setBaseUrlEdit] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -74,6 +74,13 @@ export function SettingsPopup() {
     void save();
   }
 
+  function close() {
+    setApiKey("");
+    setBaseUrlEdit(null);
+    setMessage(null);
+    composer.experimental_closePopup();
+  }
+
   return (
     <div
       role="group"
@@ -83,9 +90,16 @@ export function SettingsPopup() {
       <div className="flex items-center justify-between gap-2">
         <span className="text-sm font-medium text-foreground">NanoGPT</span>
         <span className={accepted ? "text-muted-foreground" : "text-warning"}>
-          {status === null ? "Checking..." : STATE_LABEL[status.state]}
+          {error !== null ? "Unavailable" : status === null ? "Checking..." : STATE_LABEL[status.state]}
         </span>
       </div>
+
+      {error === null ? null : (
+        <div role="alert">
+          <p>{error}</p>
+          <button type="button" className={QUIET_BUTTON_CLASS} onClick={refresh}>Retry</button>
+        </div>
+      )}
 
       <label className="flex flex-col gap-1">
         <span className="text-muted-foreground">API key</span>
@@ -136,7 +150,7 @@ export function SettingsPopup() {
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => composer.experimental_closePopup()}
+            onClick={close}
             className={QUIET_BUTTON_CLASS}
           >
             Close

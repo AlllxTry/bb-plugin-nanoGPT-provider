@@ -58,6 +58,16 @@ describe("the NanoGPT composer registration", () => {
 });
 
 describe("the gear", () => {
+  it("keeps setup reachable after a status RPC failure", async () => {
+    const view = renderSlot(gear, {}, {
+      experimental_rpcContract: nanoGptSettingsContract,
+      rpc: { getStatus: () => { throw new Error("offline"); } } as never,
+      composer: { selection: { providerId: "codex" } },
+    });
+    const button = await view.findByLabelText("NanoGPT settings");
+    await vi.waitFor(() => expect(button.getAttribute("title")).toBe("Could not load NanoGPT settings."));
+  });
+
   it("shows before any key is saved, so setup is reachable", async () => {
     const view = renderGear({ status: NONE });
     expect(await view.findByLabelText("NanoGPT settings")).toBeTruthy();
@@ -97,6 +107,33 @@ describe("the settings popup", () => {
       },
     );
   }
+
+  it("shows a status error and recovers when Retry succeeds", async () => {
+    let attempts = 0;
+    const view = renderPopup({ getStatus: () => {
+      attempts++;
+      if (attempts === 1) throw new Error("offline");
+      return VALID;
+    } });
+    expect(await view.findByRole("alert")).toBeTruthy();
+    expect(view.queryByText("Checking...")).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "Retry" }));
+    expect(await view.findByText("API key accepted")).toBeTruthy();
+    expect(view.queryByRole("alert")).toBeNull();
+    expect(attempts).toBe(2);
+  });
+
+  it("clears unsaved fields on Close even when the host retains the component", async () => {
+    const view = renderPopup({ getStatus: () => ({ state: "valid", baseUrl: "https://saved.example/v1" }) });
+    await view.findByText("API key accepted");
+    const key = view.getByLabelText("API key") as HTMLInputElement;
+    const base = view.getByLabelText("Base URL (optional)") as HTMLInputElement;
+    fireEvent.change(key, { target: { value: "unsaved-key" } });
+    fireEvent.change(base, { target: { value: "https://draft.example/v1" } });
+    fireEvent.click(view.getByRole("button", { name: "Close" }));
+    expect(key.value).toBe("");
+    expect(base.value).toBe("https://saved.example/v1");
+  });
 
   it("sends the typed key and shows NanoGPT's verdict", async () => {
     const saveKey = vi.fn(() => ({

@@ -23,6 +23,23 @@ function registeredDeclaration() {
 const ENV_CONTEXT = { threadId: null, projectId: null, hostId: "host-1" };
 
 describe("the NanoGPT provider registration", () => {
+  it("exposes plan mode and only the upstream default reasoning option", () => {
+    const { declaration } = registeredDeclaration();
+    expect(declaration.composerActions).toEqual(["plan"]);
+    expect(declaration.capabilities.reasoningLevels).toEqual(["medium"]);
+    expect(declaration.reasoningLevels).toEqual([expect.objectContaining({
+      id: "medium", label: "Provider default",
+    })]);
+    expect(declaration.deriveProviderOptions?.({
+      threadId: "thread", projectId: "project", model: "test",
+      permissionMode: "full", promptMode: "plan", settings: {},
+    })).toMatchObject({ promptMode: "plan" });
+    expect(() => declaration.deriveProviderOptions?.({
+      threadId: "thread", projectId: "project", model: "test", permissionMode: "full",
+      settings: { baseUrl: "http://example.com/v1" },
+    })).toThrow(/Base URL/);
+  });
+
   it("registers the provider with no models until a key is accepted", () => {
     const { declaration } = registeredDeclaration();
     expect(declaration.displayName).toBe("NanoGPT");

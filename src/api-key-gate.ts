@@ -1,8 +1,12 @@
+import { createHash } from "node:crypto";
+import { normalizeBaseUrl } from "./base-url.js";
+
 export type ApiKeyState = "valid" | "invalid" | "unknown";
 
 const CHECK_TIMEOUT_MS = 4000;
 const CACHE_TTL_MS = 60_000;
-const DEFAULT_BASE_URL = "https://api.nano-gpt.com/api/v1";
+const UNKNOWN_TTL_MS = 5_000;
+const MAX_CACHE_ENTRIES = 64;
 
 export interface ApiKeyCheckArgs {
   apiKey: string;
@@ -28,7 +32,7 @@ export function buildCheckRequest(
   apiKey: string,
   baseUrl: string | null,
 ): CheckRequest {
-  const base = (baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/u, "");
+  const base = normalizeBaseUrl(baseUrl);
   let host = "";
   let origin = "";
   try {
@@ -56,6 +60,7 @@ export async function checkApiKey(args: ApiKeyCheckArgs): Promise<ApiKeyState> {
   try {
     const response = await doFetch(request.url, {
       ...request.init,
+      redirect: "error",
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     });
     const target = new URL(request.url);
@@ -84,6 +89,8 @@ export interface ApiKeyGate {
   verdict(apiKey: string, baseUrl: string | null): Promise<ApiKeyState>;
   isUsable(apiKey: string, baseUrl: string | null): Promise<boolean>;
   clear(): void;
+  /** Preserve a just-verified saved key after settings change cleared the gate. */
+  rememberAccepted(apiKey: string, baseUrl: string | null): void;
 }
 
 /**
@@ -97,8 +104,23 @@ export function createApiKeyGate(
 ): ApiKeyGate {
   const cache = new Map<string, { state: ApiKeyState; at: number }>();
   const accepted = new Set<string>();
+  const inflight = new Map<string, Promise<ApiKeyState>>();
+  let generation = 0;
   const keyOf = (apiKey: string, baseUrl: string | null): string =>
-    `${baseUrl ?? ""}\n${apiKey}`;
+    createHash("sha256").update(`${normalizeBaseUrl(baseUrl)}\n${apiKey}`).digest("hex");
+
+  function store(id: string, state: ApiKeyState): void {
+    cache.delete(id);
+    cache.set(id, { state, at: now() });
+    if (state === "valid") accepted.add(id);
+    if (state === "invalid") accepted.delete(id);
+    while (cache.size > MAX_CACHE_ENTRIES) {
+      const oldest = cache.keys().next().value;
+      if (oldest === undefined) break;
+      cache.delete(oldest);
+      accepted.delete(oldest);
+    }
+  }
 
   async function verdict(
     apiKey: string,
@@ -106,33 +128,45 @@ export function createApiKeyGate(
   ): Promise<ApiKeyState> {
     const id = keyOf(apiKey, baseUrl);
     const cached = cache.get(id);
-    if (cached !== undefined && now() - cached.at < CACHE_TTL_MS) {
+    if (cached !== undefined && now() - cached.at < (cached.state === "unknown" ? UNKNOWN_TTL_MS : CACHE_TTL_MS)) {
       return cached.state;
     }
-    const state = await check({ apiKey, baseUrl });
-    if (state === "unknown") {
-      return state;
-    }
-    cache.set(id, { state, at: now() });
-    if (state === "valid") {
-      accepted.add(id);
-    } else {
-      accepted.delete(id);
-    }
-    return state;
+    const pending = inflight.get(id);
+    if (pending !== undefined) return pending;
+    if (inflight.size >= MAX_CACHE_ENTRIES) return "unknown";
+    const requestGeneration = generation;
+    const request = Promise.resolve().then(() => check({ apiKey, baseUrl }))
+      .then((state) => {
+        if (generation !== requestGeneration) return "unknown" as const;
+        store(id, state);
+        return state;
+      })
+      .finally(() => {
+        if (inflight.get(id) === request) inflight.delete(id);
+      });
+    inflight.set(id, request);
+    return request;
   }
 
   return {
     verdict,
     async isUsable(apiKey, baseUrl) {
+      const requestGeneration = generation;
       const state = await verdict(apiKey, baseUrl);
       return (
-        state === "valid" ||
-        (state === "unknown" && accepted.has(keyOf(apiKey, baseUrl)))
+        generation === requestGeneration &&
+        (state === "valid" ||
+          (state === "unknown" && accepted.has(keyOf(apiKey, baseUrl))))
       );
     },
     clear() {
+      generation++;
       cache.clear();
+      accepted.clear();
+      inflight.clear();
+    },
+    rememberAccepted(apiKey, baseUrl) {
+      store(keyOf(apiKey, baseUrl), "valid");
     },
   };
 }

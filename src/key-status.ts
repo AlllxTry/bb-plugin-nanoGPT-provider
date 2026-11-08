@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { nanoGptSettingsContract } from "./settings-contract.js";
 import { REALTIME_KEY_STATE_CHANNEL } from "./provider-id.js";
@@ -30,20 +30,35 @@ export function isStatus(value: unknown): value is Status {
 }
 
 /** The current key state, kept fresh by the server's announcements. */
-export function useKeyStatus(): { status: Status | null; refresh: () => void } {
+export function useKeyStatus(): { status: Status | null; error: string | null; refresh: () => void } {
   const rpc = useRpc<typeof nanoGptSettingsContract>();
   const [status, setStatus] = useState<Status | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const generation = useRef(0);
 
   const refresh = useCallback(() => {
+    const request = ++generation.current;
+    setError(null);
     void rpc
       .call("getStatus", null)
-      .then(setStatus)
-      .catch(() => setStatus(null));
+      .then((next) => {
+        if (request === generation.current) setStatus(next);
+      })
+      .catch(() => {
+        if (request === generation.current) setError("Could not load NanoGPT settings.");
+      });
   }, [rpc]);
 
-  useEffect(refresh, [refresh]);
+  useEffect(() => {
+    refresh();
+    return () => { generation.current++; };
+  }, [refresh]);
   useRealtime(REALTIME_KEY_STATE_CHANNEL, (payload) => {
-    if (isStatus(payload)) setStatus(payload);
+    if (isStatus(payload)) {
+      generation.current++;
+      setStatus(payload);
+      setError(null);
+    }
   });
-  return { status, refresh };
+  return { status, error, refresh };
 }

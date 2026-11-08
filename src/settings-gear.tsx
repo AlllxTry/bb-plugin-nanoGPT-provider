@@ -9,9 +9,9 @@ import { NANO_GPT_PROVIDER_ID, SETTINGS_POPUP_ID } from "./provider-id.js";
  */
 export function SettingsGear() {
   const composer = useComposer();
-  const { status } = useKeyStatus();
+  const { status, error } = useKeyStatus();
   const selected = composer.selection?.providerId === NANO_GPT_PROVIDER_ID;
-  const needsSetup = status !== null && status.state !== "valid";
+  const needsSetup = status === null || status.state !== "valid" || error !== null;
   if (!selected && !needsSetup) return null;
 
   return (
@@ -19,9 +19,9 @@ export function SettingsGear() {
       type="button"
       aria-label="NanoGPT settings"
       title={
-        status === null
+        error ?? (status === null
           ? "NanoGPT settings"
-          : `NanoGPT settings. ${STATE_LABEL[status.state]}.`
+          : `NanoGPT settings. ${STATE_LABEL[status.state]}.`)
       }
       onClick={() => composer.experimental_openPopup(SETTINGS_POPUP_ID)}
       className={

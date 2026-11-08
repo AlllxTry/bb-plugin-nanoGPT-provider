@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { NANO_GPT_DEFAULT_BASE_URL } from "./vocabulary.js";
+import { normalizeBaseUrl } from "./base-url.js";
+import { nanoGptModelIdSchema, normalizeModelId } from "./vocabulary.js";
+
+export const MODEL_LIST_TIMEOUT_MS = 10_000;
+export const STREAM_IDLE_TIMEOUT_MS = 120_000;
 
 export class NanoGptApiError extends Error {
   readonly status: number;
@@ -8,6 +12,13 @@ export class NanoGptApiError extends Error {
     super(args.message);
     this.name = "NanoGptApiError";
     this.status = args.status;
+  }
+}
+
+export class NanoGptTimeoutError extends NanoGptApiError {
+  constructor(message: string) {
+    super({ status: 0, message });
+    this.name = "NanoGptTimeoutError";
   }
 }
 
@@ -116,11 +127,26 @@ function discardLateResponse(response: Response): void {
   response.body?.cancel().catch(() => undefined);
 }
 
-function readWithAbort(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  signal: AbortSignal | undefined,
-): Promise<ReadableStreamReadResult<Uint8Array>> {
-  return raceAbort(reader.read(), signal);
+async function withDeadline<T>(
+  work: (signal: AbortSignal) => Promise<T>,
+  parent: AbortSignal | undefined,
+  ms: number,
+  message: string,
+): Promise<T> {
+  if (parent?.aborted) throw abortError();
+  const deadline = new AbortController();
+  const signal = parent === undefined ? deadline.signal : AbortSignal.any([parent, deadline.signal]);
+  const timer = setTimeout(() => deadline.abort(), ms);
+  timer.unref?.();
+  try {
+    return await work(signal);
+  } catch (error) {
+    if (parent?.aborted) throw abortError();
+    if (deadline.signal.aborted) throw new NanoGptTimeoutError(message);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const toolCallFragmentSchema = z
@@ -170,7 +196,7 @@ const streamChunkSchema = z
 
 const modelListSchema = z
   .object({
-    data: z.array(z.object({ id: z.string().min(1) }).passthrough()).min(1),
+    data: z.array(z.object({ id: nanoGptModelIdSchema }).passthrough()).min(1),
   })
   .passthrough();
 
@@ -187,6 +213,7 @@ const errorBodySchema = z
   .passthrough();
 
 interface ToolCallAccumulator {
+  index: number | undefined;
   id: string;
   name: string;
   arguments: string;
@@ -232,15 +259,12 @@ export function createNanoGptClient(args: {
   apiKey: string;
   fetch?: typeof globalThis.fetch;
 }): NanoGptClient {
-  const baseUrl = (args.baseUrl ?? NANO_GPT_DEFAULT_BASE_URL).replace(
-    /\/+$/u,
-    "",
-  );
+  const baseUrl = normalizeBaseUrl(args.baseUrl);
   const apiKey = args.apiKey;
 
   function fetchImpl(input: string, init: RequestInit): Promise<Response> {
     const fetch = args.fetch ?? globalThis.fetch;
-    return fetch(input, init);
+    return fetch(input, { ...init, redirect: "error" });
   }
 
   function authHeaders(): Record<string, string> {
@@ -263,31 +287,33 @@ export function createNanoGptClient(args: {
 
   return {
     async listModels(signal) {
-      const response = await raceAbort(
-        fetchImpl(`${baseUrl}/models`, {
-          method: "GET",
-          headers: authHeaders(),
-          signal,
-        }),
-        signal,
-        discardLateResponse,
-      );
-      if (!response.ok) {
-        await fail(response, signal);
-      }
-      const parsed = modelListSchema.safeParse(await response.json());
-      if (!parsed.success) {
-        throw new NanoGptApiError({
-          status: response.status,
-          message: "NanoGPT model list response had an unexpected shape",
-        });
-      }
-      return parsed.data.data.map((model) => model.id);
+      return withDeadline(async (requestSignal) => {
+        const response = await raceAbort(
+          fetchImpl(`${baseUrl}/models`, {
+            method: "GET",
+            headers: authHeaders(),
+            signal: requestSignal,
+          }),
+          requestSignal,
+          discardLateResponse,
+        );
+        if (!response.ok) await fail(response, requestSignal);
+        const parsed = modelListSchema.safeParse(
+          await raceAbort(response.json(), requestSignal),
+        );
+        if (!parsed.success) {
+          throw new NanoGptApiError({
+            status: response.status,
+            message: "NanoGPT model list response had an unexpected shape",
+          });
+        }
+        return parsed.data.data.map((model) => model.id);
+      }, signal, MODEL_LIST_TIMEOUT_MS, "The NanoGPT model list timed out. Please try again.");
     },
 
     async *streamChatCompletion(streamArgs) {
       const body: Record<string, unknown> = {
-        model: streamArgs.model,
+        model: normalizeModelId(streamArgs.model),
         messages: streamArgs.messages,
         stream: true,
         stream_options: { include_usage: true },
@@ -298,18 +324,18 @@ export function createNanoGptClient(args: {
       if (streamArgs.signal?.aborted === true) {
         throw abortError();
       }
-      const response = await raceAbort(
+      const response = await withDeadline((signal) => raceAbort(
         fetchImpl(`${baseUrl}/chat/completions`, {
           method: "POST",
           headers: authHeaders(),
           body: JSON.stringify(body),
-          signal: streamArgs.signal,
+          signal,
         }),
-        streamArgs.signal,
+        signal,
         discardLateResponse,
-      );
+      ), streamArgs.signal, STREAM_IDLE_TIMEOUT_MS, "NanoGPT did not return response headers in time. Please try again.");
       if (!response.ok) {
-        await fail(response, streamArgs.signal);
+        await withDeadline((signal) => fail(response, signal), streamArgs.signal, STREAM_IDLE_TIMEOUT_MS, "NanoGPT timed out while returning an error response.");
       }
       if (response.body === null) {
         throw new NanoGptApiError({
@@ -325,7 +351,9 @@ export function createNanoGptClient(args: {
       let reasoning = "";
       let messageContent = "";
       let usage: NanoGptTokenUsage | null = null;
-      const toolCalls = new Map<number, ToolCallAccumulator>();
+      const toolCalls: ToolCallAccumulator[] = [];
+      const callsByIndex = new Map<number, ToolCallAccumulator>();
+      const callsById = new Map<string, ToolCallAccumulator>();
       let doneStreaming = false;
       let sawFinishReason = false;
       let finishReason: string | null = null;
@@ -340,6 +368,13 @@ export function createNanoGptClient(args: {
           payload = JSON.parse(data);
         } catch {
           return;
+        }
+        const error = errorBodySchema.safeParse(payload);
+        if (error.success && error.data.error !== undefined) {
+          throw new NanoGptApiError({
+            status: 0,
+            message: `NanoGPT API error: ${error.data.error.message || "The upstream stream failed."}`,
+          });
         }
         const parsed = streamChunkSchema.safeParse(payload);
         if (!parsed.success) {
@@ -371,18 +406,55 @@ export function createNanoGptClient(args: {
             reasoning += reasoningFragment;
           }
           for (const fragment of delta.tool_calls ?? []) {
-            const index = fragment.index ?? 0;
-            const existing = toolCalls.get(index);
+            const index = fragment.index;
+            const id = fragment.id || undefined;
+            const byIndex =
+              index === undefined ? undefined : callsByIndex.get(index);
+            const byId = id === undefined ? undefined : callsById.get(id);
+            if (byIndex !== undefined && byId !== undefined && byIndex !== byId) {
+              throw new NanoGptApiError({
+                status: 0,
+                message: "Conflicting tool-call identifiers in the NanoGPT stream.",
+              });
+            }
+            let existing = byIndex ?? byId;
+            if (index === undefined && id === undefined) {
+              if (toolCalls.length > 1) {
+                throw new NanoGptApiError({
+                  status: 0,
+                  message: "Ambiguous tool-call fragment in the NanoGPT stream: missing index and id.",
+                });
+              }
+              existing = toolCalls[0];
+            }
             if (existing === undefined) {
-              toolCalls.set(index, {
-                id: fragment.id ?? `call_${index}`,
+              existing = {
+                index,
+                id: id ?? "",
                 name: fragment.function?.name ?? "",
                 arguments: fragment.function?.arguments ?? "",
-              });
+              };
+              toolCalls.push(existing);
+              if (index !== undefined) callsByIndex.set(index, existing);
+              if (id !== undefined) callsById.set(id, existing);
               continue;
             }
-            if (fragment.id !== undefined && fragment.id !== null) {
-              existing.id = fragment.id;
+            if (
+              (id !== undefined && existing.id !== "" && existing.id !== id) ||
+              (index !== undefined && existing.index !== undefined && existing.index !== index)
+            ) {
+              throw new NanoGptApiError({
+                status: 0,
+                message: "Conflicting tool-call identifiers in the NanoGPT stream.",
+              });
+            }
+            if (index !== undefined) {
+              existing.index = index;
+              callsByIndex.set(index, existing);
+            }
+            if (id !== undefined) {
+              existing.id = id;
+              callsById.set(id, existing);
             }
             if (
               fragment.function?.name !== undefined &&
@@ -392,7 +464,7 @@ export function createNanoGptClient(args: {
             ) {
               existing.name = fragment.function.name;
             }
-            if (fragment.function?.arguments !== undefined) {
+            if (typeof fragment.function?.arguments === "string") {
               existing.arguments += fragment.function.arguments;
             }
           }
@@ -423,9 +495,10 @@ export function createNanoGptClient(args: {
 
       try {
         while (!doneStreaming) {
-          const { done, value } = await readWithAbort(
-            reader,
-            streamArgs.signal,
+          const { done, value } = await withDeadline(
+            (signal) => raceAbort(reader.read(), signal),
+            streamArgs.signal, STREAM_IDLE_TIMEOUT_MS,
+            "The NanoGPT stream timed out while waiting for data. Please try again.",
           );
           if (value !== undefined) {
             buffer += decoder.decode(value, { stream: true });
@@ -444,12 +517,13 @@ export function createNanoGptClient(args: {
             yield* drainCollected();
             handleData(data);
           }
+          yield* drainCollected();
           if (done) {
             break;
           }
         }
         if (!doneStreaming && buffer.startsWith("data:")) {
-          handleData(buffer.slice("data:".length).trim());
+          handleData(buffer.replace(/\r$/u, "").slice("data:".length).trim());
         }
         yield* drainCollected();
       } finally {
@@ -472,26 +546,29 @@ export function createNanoGptClient(args: {
         });
       }
 
-      const orderedCalls = [...toolCalls.entries()]
-        .sort(([left], [right]) => left - right)
-        .map(([index, call]) => ({
-          id: call.id === "" ? `call_${index}` : call.id,
-          type: "function" as const,
-          function: { name: call.name, arguments: call.arguments },
-        }));
+      const orderedCalls = [...toolCalls]
+        .sort((left, right) => (left.index ?? Infinity) - (right.index ?? Infinity))
+        .map((call, position) => {
+          let id = call.id;
+          if (id === "") {
+            id = `call_${call.index ?? position}`;
+            while (callsById.has(id)) id += "_";
+            callsById.set(id, call);
+          }
+          return {
+            id,
+            type: "function" as const,
+            function: { name: call.name, arguments: call.arguments },
+          };
+        });
 
-      const finalUsage = usage;
       yield {
         type: "message",
         content: messageContent,
         toolCalls: orderedCalls,
-        usage: finalUsage,
+        usage,
         finishReason,
       };
-
     },
-
   };
 }
-
-

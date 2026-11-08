@@ -3,10 +3,40 @@
 All notable changes to this plugin. Versions follow the `vX.Y.Z` git tags that bb
 reads when you install or update the plugin.
 
-## Unreleased
+## 0.1.4 — 2026-11-09
 
-- Documentation only: the README and the agent skill now describe attachments,
-  stop behaviour, the missing file tools and the extra error messages.
+- Interrupting a turn preserves its session and conversation history, including
+  when Stop is pressed while idle. Replacing a session cancels its previous
+  turn and queue without leaking late output into the new session.
+- Failed input is excluded from subsequent requests when the model returned no
+  usable output or tool calls. Partial answers and completed tool results are
+  preserved after later failures.
+- Streamed tool arguments ignore null fragments. Parallel calls without indices
+  are matched by id; ambiguous or conflicting fragments fail before execution.
+- Errors reported inside an SSE stream retain the upstream error message.
+- Empty base URLs are stored as strings, and legacy null settings are read safely.
+- Correct default-model selection and preferred-model ordering; return the full
+  catalog instead of silently cutting it to 400 entries.
+- Plan mode has a composer action, a planning instruction and a strict tool
+  execution guard. Unknown tools never reach bb.
+- Replace ineffective reasoning choices with one Provider default option; close
+  reasoning with accumulated text. Health uses bb's current server credential
+  contribution instead of a process API-key snapshot.
+- Add a 10-second model-list deadline and 120-second completion header/idle-read
+  deadlines, including body reads. Timeouts fail turns instead of interrupting them.
+- Require HTTPS except on loopback, validate all endpoint sources consistently,
+  and reject authenticated redirects.
+- Bound model history with whole-turn eviction and a visible notice; estimate
+  multipart/tool input and generated output, and bound stored assistant/tool text.
+- Read attachments asynchronously with UTF-8-safe truncation and useful read-error
+  categories. Send local PNG/JPEG/GIF/WebP images as bounded data URLs.
+- Keep settings reachable after RPC errors, provide Retry and clear drafts on Close.
+- Deduplicate and bound credential checks using digest identities, and prevent
+  removed credentials from being restored by late results.
+- Validate model-ID syntax before sending requests; optionally diagnose unmatched
+  tool responses on stderr without logging response data.
+- Expand behavior, limitations, recovery, verification and marketplace-release
+  documentation. Existing live checks remain historical, not validation of this release.
 
 ## 0.1.3
 

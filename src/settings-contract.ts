@@ -1,5 +1,6 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { normalizeBaseUrl } from "./base-url.js";
 
 export { REALTIME_KEY_STATE_CHANNEL } from "./provider-id.js";
 
@@ -17,13 +18,13 @@ const baseUrlSchema = z
         return true;
       }
       try {
-        const protocol = new URL(value).protocol;
-        return protocol === "https:" || protocol === "http:";
+        normalizeBaseUrl(value);
+        return true;
       } catch {
         return false;
       }
     },
-    { message: "Base URL must be empty or an http(s) URL." },
+    { message: "Use HTTPS, or HTTP on localhost, 127.0.0.1 or [::1], without credentials, query or fragment." },
   );
 
 const statusSchema = z

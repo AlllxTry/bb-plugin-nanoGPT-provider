@@ -1,5 +1,6 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { checkApiKey, createApiKeyGate } from "./src/api-key-gate.js";
+import { normalizeBaseUrl } from "./src/base-url.js";
 import {
   nanoGptSettingsContract,
   REALTIME_KEY_STATE_CHANNEL,
@@ -50,10 +51,10 @@ export default function plugin(bb: BbPluginApi) {
     baseUrl: string | null;
   }> {
     const values = await settings.get();
-    const baseUrl = values.baseUrl.trim();
+    const baseUrl = (values.baseUrl ?? "").trim();
     return {
       apiKey: (values.apiKey ?? "").trim(),
-      baseUrl: baseUrl === "" ? null : baseUrl,
+      baseUrl: baseUrl === "" ? null : normalizeBaseUrl(baseUrl),
     };
   }
 
@@ -105,7 +106,8 @@ export default function plugin(bb: BbPluginApi) {
             "Could not reach NanoGPT to check the key, so it was not saved. Check your connection and try again.",
         };
       }
-      await settings.experimental_set({ apiKey, baseUrl: proposedBaseUrl });
+      await settings.experimental_set({ apiKey, baseUrl: proposedBaseUrl ?? "" });
+      gate.rememberAccepted(apiKey, proposedBaseUrl);
       announce({ state: "valid", baseUrl: proposedBaseUrl ?? "" });
       return {
         saved: true,
@@ -131,7 +133,7 @@ export default function plugin(bb: BbPluginApi) {
       expiredHint: `NanoGPT rejected the API key. Click the gear in the composer to update it.`,
       installUrl: "https://nano-gpt.com/api",
       planModeCopy:
-        "NanoGPT will outline a plan without executing tools when possible.",
+        "NanoGPT will outline a plan without executing tools.",
     },
     maintenance: { health: true, usage: false, installation: false },
     capabilities: {
@@ -142,21 +144,19 @@ export default function plugin(bb: BbPluginApi) {
       supportsThreadArchive: false,
       supportsThreadRename: false,
       permissionModes: ["full"],
-      reasoningLevels: ["low", "medium", "high"],
+      reasoningLevels: ["medium"],
     },
     reasoningLevels: [
-      { id: "low", label: "Low" },
-      { id: "medium", label: "Medium" },
-      { id: "high", label: "High" },
+      { id: "medium", label: "Provider default", description: "Reasoning is controlled by the upstream model; effort overrides are not supported." },
     ],
-    composerActions: [],
+    composerActions: ["plan"],
     models: { fallback: [], scope: "host" },
     env: { passthrough: [NANO_GPT_API_KEY_ENV, NANO_GPT_BASE_URL_ENV] },
     deriveProviderOptions(context): NanoGptProviderOptions {
       const baseUrl =
         typeof context.settings.baseUrl === "string" &&
         context.settings.baseUrl.trim() !== ""
-          ? context.settings.baseUrl.trim()
+          ? normalizeBaseUrl(context.settings.baseUrl)
           : null;
       return {
         model: context.model,
