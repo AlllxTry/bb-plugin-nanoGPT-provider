@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
 import {
@@ -908,6 +911,36 @@ describe("the NanoGPT bridge", () => {
     await startTurn("go", "creq_abcdefgh77", providerThreadId);
     await waitFor(() => boundary("failed"));
     expect(toolCallRequests()).toHaveLength(0);
+  });
+
+  it("sends the contents of an attached text file to the model", async () => {
+    await initialize();
+    const dirPath = mkdtempSync(path.join(tmpdir(), "nano-bridge-attach-"));
+    const file = path.join(dirPath, "hello-1-x.txt");
+    writeFileSync(file, "The magic word is: ORCHID-42");
+    try {
+      responses.push(answerResponse("ok"));
+      const providerThreadId = await startThread();
+      await request("turn/start", {
+        threadId: THREAD_ID,
+        providerThreadId,
+        input: [
+          { type: "text", text: "what is in it?", mentions: [] },
+          { type: "localFile", path: file, name: "hello.txt" },
+        ],
+        clientRequestId: "creq_abcdefgh7f",
+        options: FULL_OPTIONS,
+      });
+      await waitFor(() => boundary("completed"));
+      const user = (fetchCalls[0].body.messages as { role: string; content: string }[]).find(
+        (message) => message.role === "user",
+      );
+      expect(user?.content).toContain("what is in it?");
+      expect(user?.content).toContain("ORCHID-42");
+      expect(user?.content).toContain('[Attached file "hello.txt"]');
+    } finally {
+      rmSync(dirPath, { recursive: true, force: true });
+    }
   });
 
   it("rejects steering when no turn is active", async () => {

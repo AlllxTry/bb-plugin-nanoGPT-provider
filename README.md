@@ -34,6 +34,8 @@ key that NanoGPT accepts is saved, the provider offers **no models at all**.
     (up to 40 rounds per turn),
   - token **usage** reporting,
   - image inputs passed through as `image_url` parts.
+- **Attached text files** (the paperclip or add-file button) are read by the plugin
+  and sent to the model inline, up to 100000 bytes per file.
 - **Live model catalog** from `GET /models`, listed only for a key that NanoGPT
   has authenticated.
   The default model is `openai/gpt-6.1-sol`, and the first 400 models are shown.
@@ -226,6 +228,7 @@ The plugin has four parts, mirroring bb's provider plugin model:
 |-- contract.ts                # Host RPC contract (hostInfo)
 |-- src/
 |   |-- api-key-gate.ts        # Key validation + verdict cache
+|   |-- attachments.ts         # Reads attached text files for the model
 |   |-- key-status.ts          # Frontend hook: key state from RPC + realtime
 |   |-- nano-gpt-client.ts     # HTTP client: SSE streaming, tool-call assembly, models
 |   |-- provider-bridge.ts     # Bridge: sessions, turns, tool loop, JSON-RPC
@@ -246,6 +249,7 @@ The plugin has four parts, mirroring bb's provider plugin model:
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
 | `src/nano-gpt-client.ts` | `streamChatCompletion` (SSE parsing, text and reasoning deltas, tool-call fragments, usage), `listModels`, typed `NanoGptApiError`. |
 | `src/provider-bridge.ts` | Session map, turn queue, steering, stop and interrupt, thread delta emission, tool round loop, model list, health.                |
+| `src/attachments.ts`     | `describeAttachedFile`: inlines attached text files for the model, describes binary, unreadable and over-long ones honestly. |
 | `src/api-key-gate.ts`    | `checkApiKey` (valid, invalid or unknown) and `createApiKeyGate` (verdict cache and offline behaviour).                           |
 | `src/vocabulary.ts`      | Provider id (`nano-gpt`), default base URL, env var names, default model, `MAX_TOOL_ROUNDS`.                                      |
 
@@ -287,7 +291,7 @@ npm test
 | Area         | What is covered                                                                                                          |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | Client       | SSE streaming of text, reasoning, tool-call fragments and usage; HTTP error mapping; model list parsing.                 |
-| Bridge       | `initialize`, a full tool round, API errors, steering, health, model listing with and without a key, a turn with no key, usage summed over rounds, unique item ids, invalid tool arguments, stop during a pending tool call (item closed as interrupted), a request hung before or after the headers (released by the abort, late responses dropped, another thread still runs), a queued follow-up dropped on stop, queued turns, one acknowledgement per steered input, cut-off and length-limited streams, no restore claim. |
+| Bridge       | `initialize`, a full tool round, API errors, steering, health, model listing with and without a key, a turn with no key, usage summed over rounds, unique item ids, invalid tool arguments, stop during a pending tool call (item closed as interrupted), a request hung before or after the headers (released by the abort, late responses dropped, another thread still runs), a queued follow-up dropped on stop, attached text files read and sent inline (text, long, binary, empty, unreadable), queued turns, one acknowledgement per steered input, cut-off and length-limited streams, no restore claim. |
 | API key gate | valid, invalid and unknown verdicts, verdict caching, offline behaviour, re-check after a clear.                         |
 | Registration | provider declaration, env passthrough, and no env contribution without a saved key.                                      |
 | Settings RPC | a rejected or unreachable key is not saved; an accepted key is saved, announced over realtime and contributed as env; no result ever contains the key; a bad base URL is refused. |
@@ -353,9 +357,17 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
   tool loops. Usage that NanoGPT reports is used as is.
 - Tool calls whose arguments are not valid JSON are not run; the model gets an
   error and can retry.
+- bb gives a NanoGPT thread no file or shell tools of its own (checked in bb 0.49.0 with
+  the full permission mode): the agent only has the dynamic tools bb offers, such as
+  asking a question or running a workflow. Providers such as Codex or Claude Code
+  bring their own file tools; this one does not. Attach a file to let the model read
+  it.
 - Tool-result images are not sent back into the model context.
-- Local image and file attachments are sent as a text placeholder (their path or
-  name), not their contents.
+- Attached text files (the paperclip or add-file button) are read by the plugin and
+  sent to the model inline, up to 100000 bytes per file; a longer file is cut and
+  the model is told so. Binary files and files that cannot be read are described
+  to the model as unavailable, never guessed at. Local images are still sent only
+  as a text placeholder with their path, not their pixels.
 - The reasoning-level picker (low, medium, high) is **not** forwarded to the API
   as `reasoning_effort`, because some routed providers reject it.
 - Only the `full` permission mode is offered. There is no fork, archive, rename,
@@ -367,11 +379,18 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
   `nano-gpt` provider is registered, the gear and the settings form appear in the
   composer, a rejected key is not saved, a real key is accepted by NanoGPT, and
   the server then loads a catalog of 400 models. With no key the picker offers no
-  models. The author also ran a live agent request against NanoGPT with a real
-  key and the API key check on plugin versions 0.1.0 to 0.1.2. The turn-lifecycle
-  fixes after 0.1.2 (queued turns, cancelled tool calls, summed usage, cut-off
-  streams) are covered by unit tests with a stubbed `fetch` and have not been
-  re-run live yet.
+  models.
+- Smoke-tested before v0.1.3 in that live bb with a real key, driven through the bb
+  CLI (`bb thread spawn`, `tell` and `stop`) and read back from the thread event
+  log, not through the app window. Installing over the previous version kept the
+  saved key. A plain turn and a tool call each ended with one terminal event. Stop
+  during streaming, during a running tool call and during a hung API request each
+  ended with one `interrupted` event and closed the tool item as interrupted. A
+  message sent mid-turn was acknowledged once, a thread started after a Stop got
+  none of the stopped thread's events, and an attached text file was read
+  correctly. The tool-call checks used bb's own tools and a temporary slow test
+  tool, so file tools were not exercised. Streaming with reasoning content was
+  not seen live.
 
 ## Support the project
 

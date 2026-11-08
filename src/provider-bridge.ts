@@ -28,6 +28,7 @@ import {
   turnSteerParamsSchema,
 } from "@get-bb/plugin-sdk/provider-bridge";
 import { randomUUID } from "node:crypto";
+import { describeAttachedFile } from "./attachments.js";
 import { z } from "zod";
 import {
   type NanoGptContentPart,
@@ -215,7 +216,7 @@ function userContent(input: readonly PromptInput[]): string | NanoGptContentPart
     }
     parts.push({
       type: "text",
-      text: `[file: ${item.name ?? item.path}]`,
+      text: describeAttachedFile(item),
     });
   }
   if (parts.every((part) => part.type === "text")) {
