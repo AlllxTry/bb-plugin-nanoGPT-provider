@@ -1,14 +1,21 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { createApiKeyGate } from "./src/api-key-gate.js";
 import {
+  nanoGptSettingsContract,
+  REALTIME_KEY_STATE_CHANNEL,
+  type NanoGptStatus,
+} from "./src/settings-contract.js";
+import {
   NANO_GPT_API_KEY_ENV,
   NANO_GPT_BASE_URL_ENV,
   NANO_GPT_PROVIDER_ID,
   type NanoGptProviderOptions,
 } from "./src/vocabulary.js";
 
+export { nanoGptSettingsContract };
+
 const SETUP_HINT =
-  "Open the NanoGPT provider plugin settings and paste an API key from https://nano-gpt.com/api.";
+  "Click the gear in the composer, or open the NanoGPT provider plugin settings, and paste an API key from https://nano-gpt.com/api.";
 
 export default function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
@@ -33,18 +40,81 @@ export default function plugin(bb: BbPluginApi) {
     gate.clear();
   });
 
+  async function readSaved(): Promise<{
+    apiKey: string;
+    baseUrl: string | null;
+  }> {
+    const values = await settings.get();
+    const baseUrl = values.baseUrl.trim();
+    return {
+      apiKey: (values.apiKey ?? "").trim(),
+      baseUrl: baseUrl === "" ? null : baseUrl,
+    };
+  }
+
   async function usableCredentials(): Promise<{
     apiKey: string;
     baseUrl: string | null;
   } | null> {
-    const values = await settings.get();
-    const apiKey = (values.apiKey ?? "").trim();
-    if (apiKey === "") {
+    const saved = await readSaved();
+    if (saved.apiKey === "") {
       return null;
     }
-    const baseUrl = values.baseUrl.trim() === "" ? null : values.baseUrl.trim();
-    return (await gate.isUsable(apiKey, baseUrl)) ? { apiKey, baseUrl } : null;
+    return (await gate.isUsable(saved.apiKey, saved.baseUrl)) ? saved : null;
   }
+
+  async function status(): Promise<NanoGptStatus> {
+    const saved = await readSaved();
+    if (saved.apiKey === "") {
+      return { state: "none", baseUrl: saved.baseUrl ?? "" };
+    }
+    return {
+      state: await gate.verdict(saved.apiKey, saved.baseUrl),
+      baseUrl: saved.baseUrl ?? "",
+    };
+  }
+
+  function announce(next: NanoGptStatus): void {
+    bb.realtime.publish(REALTIME_KEY_STATE_CHANNEL, next);
+  }
+
+  bb.rpc.register(nanoGptSettingsContract, {
+    getStatus: () => status(),
+
+    async saveKey({ apiKey, baseUrl }) {
+      const proposedBaseUrl = baseUrl === "" ? null : baseUrl;
+      const state = await gate.verdict(apiKey, proposedBaseUrl);
+      if (state === "invalid") {
+        return {
+          saved: false,
+          state,
+          message: "NanoGPT rejected this API key. Check it and try again.",
+        };
+      }
+      if (state === "unknown") {
+        return {
+          saved: false,
+          state,
+          message:
+            "Could not reach NanoGPT to check the key, so it was not saved. Check your connection and try again.",
+        };
+      }
+      await settings.experimental_set({ apiKey, baseUrl: proposedBaseUrl });
+      announce({ state: "valid", baseUrl: proposedBaseUrl ?? "" });
+      return {
+        saved: true,
+        state,
+        message: "Key accepted. NanoGPT models are loading.",
+      };
+    },
+
+    async clearKey() {
+      await settings.experimental_set({ apiKey: null });
+      const next = await status();
+      announce(next);
+      return next;
+    },
+  });
 
   bb.providers.register({
     id: NANO_GPT_PROVIDER_ID,
@@ -52,7 +122,7 @@ export default function plugin(bb: BbPluginApi) {
     icon: "Zap",
     strings: {
       signInHint: SETUP_HINT,
-      expiredHint: `NanoGPT rejected the API key. Update it in the NanoGPT provider plugin settings.`,
+      expiredHint: `NanoGPT rejected the API key. Click the gear in the composer to update it.`,
       installUrl: "https://nano-gpt.com/api",
       planModeCopy:
         "NanoGPT will outline a plan without executing tools when possible.",
@@ -126,10 +196,4 @@ export default function plugin(bb: BbPluginApi) {
           };
     },
   );
-
-  void settings.get().then((values) => {
-    if ((values.apiKey ?? "").trim() === "") {
-      bb.status.needsConfiguration(SETUP_HINT);
-    }
-  });
 }

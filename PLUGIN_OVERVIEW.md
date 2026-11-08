@@ -2,6 +2,7 @@ Pick NanoGPT in the provider list, choose any of its models, and run bb threads 
 
 ## What you get
 
+- A gear in the composer that opens a small form for your API key, so setup doesn't send you to the plugin list.
 - The live NanoGPT model catalog, fetched with your key.
 - Streaming answers with a separate reasoning channel.
 - Tool calls, so the agent can read and edit files in your project like it does with any other provider.

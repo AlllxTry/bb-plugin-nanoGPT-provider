@@ -1,4 +1,4 @@
-﻿# bb-plugin-nanoGPT-provider
+# bb-plugin-nanoGPT-provider
 
 A [bb](https://github.com/get-bb/bb) **agent provider plugin** that connects bb to
 [NanoGPT](https://nano-gpt.com/api), one OpenAI-compatible API in front of
@@ -38,8 +38,14 @@ key that NanoGPT accepts is saved, the provider offers **no models at all**.
   The default model is `openai/gpt-6.1-sol`, and the first 400 models are shown.
 - **API key gate**: models and credentials are unavailable until NanoGPT accepts
   the key (see [below](#how-the-api-key-gate-works)).
+- **A gear in the composer** that opens a small settings form where you paste
+  the key, optionally set a base URL, and remove the key. You don't have to go to
+  Plugins to set the plugin up. The key is checked with NanoGPT before it is
+  saved, so a wrong key is never stored. The same form is in the composer's `+`
+  menu as "NanoGPT settings…".
 - **Key stored as a secret setting**: bb keeps it in a `0600` file under the
-  plugin data dir, never in the database and never sent to the frontend.
+  plugin data dir, never in the database. No RPC method returns it, so the
+  frontend can write the key but never read it back.
 - **Steering and interruption**: follow-up messages sent mid-turn are queued, and
   `thread/stop` aborts the in-flight request.
 - **Configurable base URL** to point at any other OpenAI-compatible endpoint
@@ -73,10 +79,15 @@ npm run install:bb        # = bb plugin install . --yes
 
 Then, in bb:
 
-1. Open the **NanoGPT provider** plugin's settings.
-2. Paste your **NanoGPT API key**.
-3. Reload the plugin (`bb plugin reload nanogpt-provider`) or restart bb.
-4. Choose **NanoGPT** in the provider picker and pick a model.
+1. Click the **gear** in the composer (it shows while NanoGPT still needs a key,
+   and whenever NanoGPT is the selected provider). The same form opens from the
+   composer's `+` menu, under "NanoGPT settings…".
+2. Paste your **NanoGPT API key** and press **Save**. The plugin checks the key
+   with NanoGPT first. A rejected key is not saved.
+3. Choose **NanoGPT** in the provider picker and pick a model.
+
+Settings are also available the long way: Settings → Plugins → NanoGPT provider,
+or `bb plugin config nanogpt-provider`.
 
 > **Plugin id.** bb derives it from the package name by dropping the
 > `bb-plugin-` prefix, so the package `bb-plugin-nanogpt-provider` becomes `nanogpt-provider`. That is the id
@@ -145,12 +156,18 @@ saved, the plugin marks itself as needing configuration.
 
 ## Architecture
 
-The plugin has three parts, mirroring bb's provider plugin model:
+The plugin has four parts, mirroring bb's provider plugin model:
 
 ```
++----------------------- bb app (browser) --------------------+
+| app.tsx                                                     |
+|  - composer gear, + menu row, settings popup                |
+|  - writes the key through RPC; can never read it back       |
++------------------------------+------------------------------+
+                               | RPC: getStatus, saveKey, clearKey
 +------------------------- bb server -------------------------+
 | server.ts                                                   |
-|  - defines settings (apiKey, baseUrl)                       |
+|  - defines settings (apiKey, baseUrl) and the settings RPC  |
 |  - registers the "nano-gpt" provider (no fallback models)   |
 |  - API key gate -> contributes the NANOGPT_API_KEY env      |
 +------------------------------+------------------------------+
@@ -168,8 +185,13 @@ The plugin has three parts, mirroring bb's provider plugin model:
                       +------------------+
 ```
 
-- **`server.ts`** runs inside the bb server. It owns the settings, the provider
-  registration and the key gate. It never sees conversation content.
+- **`app.tsx`** is the frontend, bundled to `dist/app.js`. It adds the gear, the
+  `+` menu row and the settings popup to bb's composer. It only talks to the
+  server through three RPC methods, and none of them returns the key.
+- **`server.ts`** runs inside the bb server. It owns the settings, the settings
+  RPC, the provider registration and the key gate. It never sees conversation
+  content. Saving a key checks it with NanoGPT first and only stores a key that
+  NanoGPT accepts.
 - **`host.ts`** is bundled into `dist/host.js` and run by the bb host daemon. It
   exports the provider bridge, which is where the agent loop lives.
 - **The bridge** (`src/provider-bridge.ts`) speaks bb's provider bridge protocol
@@ -181,13 +203,19 @@ The plugin has three parts, mirroring bb's provider plugin model:
 
 ```
 .
-|-- server.ts                  # Plugin entry (bb.server): settings, provider, key gate
+|-- server.ts                  # Plugin entry (bb.server): settings, settings RPC, provider, key gate
+|-- app.tsx                    # Frontend entry (bb.app): composer gear, + menu row, settings popup
 |-- host.ts                    # Host entry (bb.host): bridge + host RPC
 |-- contract.ts                # Host RPC contract (hostInfo)
 |-- src/
 |   |-- api-key-gate.ts        # Key validation + verdict cache
+|   |-- key-status.ts          # Frontend hook: key state from RPC + realtime
 |   |-- nano-gpt-client.ts     # HTTP client: SSE streaming, tool-call assembly, models
 |   |-- provider-bridge.ts     # Bridge: sessions, turns, tool loop, JSON-RPC
+|   |-- provider-id.ts         # Provider, channel and popup ids shared by server and app
+|   |-- settings-contract.ts   # RPC contract: getStatus, saveKey, clearKey
+|   |-- settings-gear.tsx      # The composer gear
+|   |-- settings-popup.tsx     # The key form
 |   `-- vocabulary.ts          # Constants, provider options schema, helpers
 |-- *.test.ts, src/*.test.ts   # Unit tests (vitest)
 |-- package.json               # The plugin manifest lives under the "bb" key
@@ -231,7 +259,7 @@ Notes:
 
 ## Testing
 
-The suite has 22 tests and runs with `vitest` and the SDK's testing helpers. No
+The suite has 43 tests and runs with `vitest` and the SDK's testing helpers. No
 test touches the network, because `fetch` is stubbed.
 
 | Area         | What is covered                                                                                                          |
@@ -240,6 +268,8 @@ test touches the network, because `fetch` is stubbed.
 | Bridge       | `initialize`, a full tool round, API errors, steering, health, model listing with and without a key, a turn with no key. |
 | API key gate | valid, invalid and unknown verdicts, verdict caching, offline behaviour, re-check after a clear.                         |
 | Registration | provider declaration, env passthrough, and no env contribution without a saved key.                                      |
+| Settings RPC | a rejected or unreachable key is not saved; an accepted key is saved, announced over realtime and contributed as env; no result ever contains the key; a bad base URL is refused. |
+| Composer UI  | the gear shows before setup and for the selected provider, the popup sends the typed key and shows NanoGPT's verdict, the key field is a password field. |
 | Host         | one host artifact exports both a provider bridge and a host RPC entry.                                                   |
 
 ```bash
@@ -289,10 +319,11 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
 - The model list is capped at 400 entries, with a few preferred models first.
 - Model descriptions are generic, and context-window sizes are not reported.
 - Mobile and web clients have not been tested.
-- Checked in a live bb: the plugin installs, the `nano-gpt` provider is
-  registered, and the picker offers no models with no key or with a rejected key.
-  Not checked with a real, valid NanoGPT key: the live model list and a full
-  turn.
+- Checked in a live bb: the plugin installs and runs, the `nano-gpt` provider is
+  registered, the settings RPC answers, a rejected key is not saved, and the
+  picker offers no models with no key. Not checked: how the gear and the form
+  look and behave in the composer window, and anything that needs a real, valid
+  NanoGPT key (the live model list and a full turn).
 
 ## Author
 

@@ -69,6 +69,8 @@ export async function checkApiKey(args: ApiKeyCheckArgs): Promise<ApiKeyState> {
 }
 
 export interface ApiKeyGate {
+  /** NanoGPT's current answer for the key, cached for a minute. */
+  verdict(apiKey: string, baseUrl: string | null): Promise<ApiKeyState>;
   isUsable(apiKey: string, baseUrl: string | null): Promise<boolean>;
   clear(): void;
 }
@@ -84,24 +86,39 @@ export function createApiKeyGate(
 ): ApiKeyGate {
   const cache = new Map<string, { state: ApiKeyState; at: number }>();
   const accepted = new Set<string>();
+  const keyOf = (apiKey: string, baseUrl: string | null): string =>
+    `${baseUrl ?? ""}\n${apiKey}`;
+
+  async function verdict(
+    apiKey: string,
+    baseUrl: string | null,
+  ): Promise<ApiKeyState> {
+    const id = keyOf(apiKey, baseUrl);
+    const cached = cache.get(id);
+    if (cached !== undefined && now() - cached.at < CACHE_TTL_MS) {
+      return cached.state;
+    }
+    const state = await check({ apiKey, baseUrl });
+    if (state === "unknown") {
+      return state;
+    }
+    cache.set(id, { state, at: now() });
+    if (state === "valid") {
+      accepted.add(id);
+    } else {
+      accepted.delete(id);
+    }
+    return state;
+  }
+
   return {
+    verdict,
     async isUsable(apiKey, baseUrl) {
-      const id = `${baseUrl ?? ""}\n${apiKey}`;
-      const cached = cache.get(id);
-      if (cached !== undefined && now() - cached.at < CACHE_TTL_MS) {
-        return cached.state === "valid";
-      }
-      const state = await check({ apiKey, baseUrl });
-      if (state === "unknown") {
-        return accepted.has(id);
-      }
-      cache.set(id, { state, at: now() });
-      if (state === "valid") {
-        accepted.add(id);
-      } else {
-        accepted.delete(id);
-      }
-      return state === "valid";
+      const state = await verdict(apiKey, baseUrl);
+      return (
+        state === "valid" ||
+        (state === "unknown" && accepted.has(keyOf(apiKey, baseUrl)))
+      );
     },
     clear() {
       cache.clear();
