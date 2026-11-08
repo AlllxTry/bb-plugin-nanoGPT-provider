@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "license": "MIT",
+  "author": "Oleksander Trybushnyi",
   "description": "bb agent provider for NanoGPT's OpenAI-compatible API.",
   "engines": {
     "bb": ">=0.0",

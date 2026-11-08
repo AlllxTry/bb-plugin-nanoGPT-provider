@@ -20,6 +20,7 @@ key that NanoGPT accepts is saved, the provider offers **no models at all**.
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
 - [Limitations](#limitations)
+- [Author](#author)
 - [License](#license)
 
 ---
@@ -283,9 +284,13 @@ Plugin logs: `bb plugin logs nano-gpt`.
   pass, but the end-to-end flow (key saved, models appear, a turn runs) is
   unverified.
 
+## Author
+
+Oleksander Trybushnyi
+
 ## License
 
-[MIT](./LICENSE)
+[MIT](./LICENSE) © 2026 Oleksander Trybushnyi
 
 npm test
 ```
