@@ -279,6 +279,10 @@ Notes:
 The suite has 48 tests and runs with `vitest` and the SDK's testing helpers. No
 test touches the network, because `fetch` is stubbed.
 
+```bash
+npm test
+```
+
 | Area         | What is covered                                                                                                          |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | Client       | SSE streaming of text, reasoning, tool-call fragments and usage; HTTP error mapping; model list parsing.                 |
@@ -288,8 +292,6 @@ test touches the network, because `fetch` is stubbed.
 | Settings RPC | a rejected or unreachable key is not saved; an accepted key is saved, announced over realtime and contributed as env; no result ever contains the key; a bad base URL is refused. |
 | Composer UI  | the gear shows before setup and for the selected provider, the popup sends the typed key and shows NanoGPT's verdict, the key field is a password field. |
 | Host         | one host artifact exports both a provider bridge and a host RPC entry.                                                   |
-
-```bash
 
 ## Troubleshooting
 
@@ -370,7 +372,4 @@ Oleksander Trybushnyi
 ## License
 
 [MIT](./LICENSE) (c) 2026 Oleksander Trybushnyi
-
-npm test
-```
 
