@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildCheckRequest,
   checkApiKey,
   createApiKeyGate,
   type ApiKeyState,
@@ -9,13 +10,54 @@ function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status });
 }
 
+describe("buildCheckRequest", () => {
+  it("uses the authenticated check-balance endpoint for the default base URL", () => {
+    const request = buildCheckRequest("sk-1", null);
+    expect(request.url).toBe("https://api.nano-gpt.com/api/check-balance");
+    expect(request.init.method).toBe("POST");
+    expect(request.init.headers).toEqual({ "x-api-key": "sk-1" });
+  });
+
+  it("uses check-balance on any nano-gpt.com base URL, including v1legacy", () => {
+    expect(
+      buildCheckRequest("k", "https://nano-gpt.com/api/v1legacy/").url,
+    ).toBe("https://nano-gpt.com/api/check-balance");
+  });
+
+  it("does not treat a look-alike host as NanoGPT", () => {
+    const request = buildCheckRequest("k", "https://evil-nano-gpt.com/v1");
+    expect(request.url).toBe("https://evil-nano-gpt.com/v1/models");
+    expect(request.init.method).toBe("GET");
+    expect(request.init.headers).toEqual({ authorization: "Bearer k" });
+  });
+
+  it("falls back to an authenticated models call for another host", () => {
+    expect(buildCheckRequest("k", "http://localhost:8080/v1").url).toBe(
+      "http://localhost:8080/v1/models",
+    );
+  });
+});
+
 describe("checkApiKey", () => {
-  it("accepts a key NanoGPT lists models for", async () => {
+  it("never validates a key through the unauthenticated models endpoint", async () => {
+    const urls: string[] = [];
+    await checkApiKey({
+      apiKey: "good",
+      baseUrl: null,
+      fetch: async (input) => {
+        urls.push(String(input));
+        return jsonResponse({ balance: 1 });
+      },
+    });
+    expect(urls).toEqual(["https://api.nano-gpt.com/api/check-balance"]);
+  });
+
+  it("accepts a key NanoGPT authenticates", async () => {
     await expect(
       checkApiKey({
         apiKey: "good",
         baseUrl: null,
-        fetch: async () => jsonResponse({ data: [{ id: "a/b" }] }),
+        fetch: async () => jsonResponse({ usd_balance: "1.00" }),
       }),
     ).resolves.toBe("valid");
   });

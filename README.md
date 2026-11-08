@@ -33,7 +33,8 @@ key that NanoGPT accepts is saved, the provider offers **no models at all**.
     (up to 40 rounds per turn),
   - token **usage** reporting,
   - image inputs passed through as `image_url` parts.
-- **Live model catalog** from `GET /models`, listed only for a validated key.
+- **Live model catalog** from `GET /models`, listed only for a key that NanoGPT
+  has authenticated.
   The default model is `openai/gpt-6.1-sol`, and the first 400 models are shown.
 - **API key gate**: models and credentials are unavailable until NanoGPT accepts
   the key (see [below](#how-the-api-key-gate-works)).
@@ -115,10 +116,18 @@ clients that fail on reasoning output. Set it as `baseUrl` if you hit that.
 The goal: **no valid key, no models.**
 
 1. The plugin reads `apiKey` from its settings.
-2. It asks NanoGPT (`GET /models`, 4-second timeout) whether the key is accepted:
+2. It asks NanoGPT whether the key is accepted, with a 4-second timeout. It calls
+   `POST /api/check-balance` with the key in the `x-api-key` header. It does
+   **not** use `GET /models`, because NanoGPT answers that endpoint with HTTP 200
+   even when the key is missing or wrong, so it proves nothing.
    - **HTTP 200**: the key is valid.
    - **HTTP 401 or 403**: the key is rejected.
    - **Network error, timeout, or any other status**: the verdict is unknown.
+
+   If `baseUrl` points at a host other than `nano-gpt.com`, there is no
+   `check-balance` endpoint to call. The plugin then falls back to an
+   authenticated `GET <baseUrl>/models`, which only proves that the endpoint
+   answers, so use the default URL if you want real key validation.
 3. Only a **valid** key is handed to the provider. bb does this by contributing it
    as an environment variable (`NANOGPT_API_KEY`) to the NanoGPT bridge process.
 4. The bridge lists models **only** if it received a key. With no key it answers
@@ -264,7 +273,7 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
   enabled. Treat diagnostic logs as sensitive.
 - The plugin sends your prompts, tool results and attached images to NanoGPT, or
   to whatever `baseUrl` you set. Review NanoGPT's privacy terms before use.
-- The key is validated against NanoGPT only, with `GET /models`.
+- The key is validated against NanoGPT only, with `POST /api/check-balance`.
 
 ## Limitations
 
@@ -280,9 +289,10 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
 - The model list is capped at 400 entries, with a few preferred models first.
 - Model descriptions are generic, and context-window sizes are not reported.
 - Mobile and web clients have not been tested.
-- The plugin has not yet been run inside a live bb. The tests and the build
-  pass, but the end-to-end flow (key saved, models appear, a turn runs) is
-  unverified.
+- Checked in a live bb: the plugin installs, the `nano-gpt` provider is
+  registered, and the picker offers no models with no key or with a rejected key.
+  Not checked with a real, valid NanoGPT key: the live model list and a full
+  turn.
 
 ## Author
 
