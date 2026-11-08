@@ -148,6 +148,52 @@ describe("streamChatCompletion", () => {
     });
   });
 
+  it("ends a read that never produces data when the signal aborts", async () => {
+    // The injected fetch ignores the signal and the body never yields a chunk,
+    // like a non-cooperative transport.
+    const client = createNanoGptClient({
+      apiKey: "sk-nano-test",
+      fetch: async () =>
+        new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+    });
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = collect(
+      client.streamChatCompletion({
+        model: "x",
+        messages: [{ role: "user", content: "hi" }],
+        signal: controller.signal,
+      }),
+    );
+    setTimeout(() => controller.abort(), 20);
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it("rejects at once when the signal is already aborted", async () => {
+    const client = createNanoGptClient({
+      apiKey: "sk-nano-test",
+      fetch: async () =>
+        new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+          status: 200,
+        }),
+    });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      collect(
+        client.streamChatCompletion({
+          model: "x",
+          messages: [{ role: "user", content: "hi" }],
+          signal: controller.signal,
+        }),
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+  });
+
   it("fails a stream that ends with no [DONE] and no finish reason", async () => {
     const client = createNanoGptClient({
       apiKey: "sk-nano-test",

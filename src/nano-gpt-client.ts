@@ -58,6 +58,41 @@ export type NanoGptStreamEvent =
       finishReason: string | null;
     };
 
+function abortError(): DOMException {
+  return new DOMException("The operation was aborted.", "AbortError");
+}
+
+/**
+ * `reader.read()` that also ends when the signal aborts. A standards-compliant
+ * `fetch` already rejects an aborted read; this keeps the turn from hanging
+ * if a transport ignores the signal and never produces another chunk.
+ */
+function readWithAbort(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal | undefined,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (signal === undefined) {
+    return reader.read();
+  }
+  if (signal.aborted) {
+    return Promise.reject(abortError());
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => reject(abortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader.read().then(
+      (result) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(result);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 const toolCallFragmentSchema = z
   .object({
     index: z.number().int().nonnegative().optional(),
@@ -342,36 +377,42 @@ export function createNanoGptClient(args: {
         }
       }
 
-      while (!doneStreaming) {
-        const { done, value } = await reader.read();
-        if (value !== undefined) {
-          buffer += decoder.decode(value, { stream: true });
-        }
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const rawLine of lines) {
-          const line = rawLine.replace(/\r$/u, "");
-          if (!line.startsWith("data:")) {
-            continue;
-          }
-          const data = line.slice("data:".length).trim();
-          if (data === "") {
-            continue;
-          }
-          yield* drainCollected();
-          handleData(data);
-        }
-        if (done) {
-          break;
-        }
-      }
-      if (!doneStreaming && buffer.startsWith("data:")) {
-        handleData(buffer.slice("data:".length).trim());
-      }
-      yield* drainCollected();
       try {
-        await reader.cancel();
-      } catch {
+        while (!doneStreaming) {
+          const { done, value } = await readWithAbort(
+            reader,
+            streamArgs.signal,
+          );
+          if (value !== undefined) {
+            buffer += decoder.decode(value, { stream: true });
+          }
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const rawLine of lines) {
+            const line = rawLine.replace(/\r$/u, "");
+            if (!line.startsWith("data:")) {
+              continue;
+            }
+            const data = line.slice("data:".length).trim();
+            if (data === "") {
+              continue;
+            }
+            yield* drainCollected();
+            handleData(data);
+          }
+          if (done) {
+            break;
+          }
+        }
+        if (!doneStreaming && buffer.startsWith("data:")) {
+          handleData(buffer.slice("data:".length).trim());
+        }
+        yield* drainCollected();
+      } finally {
+        // Always release the connection, on success, error and abort. The
+        // cancel is not awaited: a misbehaving transport may never settle it,
+        // and that must not keep this generator (or the turn) alive.
+        reader.cancel().catch(() => undefined);
       }
 
       // A stream that stops without [DONE] and without a finish_reason was cut

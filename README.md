@@ -277,8 +277,8 @@ Notes:
 
 ## Testing
 
-The suite has 48 tests and runs with `vitest` and the SDK's testing helpers. No
-test touches the network, because `fetch` is stubbed.
+The suite runs with `vitest` and the SDK's testing helpers. No test touches the
+network, because `fetch` is stubbed. `npm test` prints the current test count.
 
 ```bash
 npm test
@@ -287,7 +287,7 @@ npm test
 | Area         | What is covered                                                                                                          |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | Client       | SSE streaming of text, reasoning, tool-call fragments and usage; HTTP error mapping; model list parsing.                 |
-| Bridge       | `initialize`, a full tool round, API errors, steering, health, model listing with and without a key, a turn with no key, usage summed over rounds, unique item ids, invalid tool arguments, stop during a pending tool call (item closed as interrupted), a hung request on stop, queued turns, one acknowledgement per steered input, cut-off and length-limited streams, no restore claim. |
+| Bridge       | `initialize`, a full tool round, API errors, steering, health, model listing with and without a key, a turn with no key, usage summed over rounds, unique item ids, invalid tool arguments, stop during a pending tool call (item closed as interrupted), a hung request on stop (released by the abort, and another thread still runs), queued turns, one acknowledgement per steered input, cut-off and length-limited streams, no restore claim. |
 | API key gate | valid, invalid and unknown verdicts, verdict caching, offline behaviour, re-check after a clear.                         |
 | Registration | provider declaration, env passthrough, and no env contribution without a saved key.                                      |
 | Settings RPC | a rejected or unreachable key is not saved; an accepted key is saved, announced over realtime and contributed as env; no result ever contains the key; a bad base URL is refused. |
@@ -341,6 +341,12 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
   the model history. A stop that the request does not honour in time still ends
   with an interrupted event.
 - A queued follow-up message is acknowledged once, when it arrives.
+- Cancelling a turn also ends a response read that the transport leaves hanging,
+  so a stuck request cannot keep the turn or its stream alive.
+- When NanoGPT does not report token usage, the plugin estimates it from the
+  conversation text (about four characters per token), once per model round. The
+  estimate counts the whole history each round, so it can overstate usage in long
+  tool loops. Usage that NanoGPT reports is used as is.
 - Tool calls whose arguments are not valid JSON are not run; the model gets an
   error and can retry.
 - Tool-result images are not sent back into the model context.

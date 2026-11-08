@@ -676,6 +676,7 @@ describe("the NanoGPT bridge", () => {
     const providerThreadId = await startThread();
     await startTurn("hang", "creq_abcdefgh75", providerThreadId);
     await waitFor(() => fetchCalls.length === 1);
+    const started = Date.now();
     const stop = await request("thread/stop", {
       threadId: THREAD_ID,
       providerThreadId,
@@ -684,11 +685,60 @@ describe("the NanoGPT bridge", () => {
       activeTurnId: null,
     });
     expect(stop.error).toBeUndefined();
+    // The worker is released by the abort itself, not by the 2 s fallback.
+    expect(Date.now() - started).toBeLessThan(1000);
     expect(boundary("interrupted")).toBe(true);
     const boundaries = (deltaNotifications() as BoundaryDelta[]).filter(
       (delta) => delta.kind === "turn.boundary",
     );
     expect(boundaries).toHaveLength(1);
+  }, 10_000);
+
+  it("runs another thread normally after a hung request was stopped", async () => {
+    await initialize();
+    responses.push(
+      new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+      answerResponse("fresh"),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("hang", "creq_abcdefgh79", providerThreadId);
+    await waitFor(() => fetchCalls.length === 1);
+    await request("thread/stop", {
+      threadId: THREAD_ID,
+      providerThreadId,
+      intent: "interrupt",
+      activeTurnId: null,
+    });
+    const staleCount = deltaNotifications().length;
+
+    const otherThread = "thr_nano_gpt_other";
+    const started = await request("thread/start", {
+      threadId: otherThread,
+      cwd: CWD,
+      instructionMode: "append",
+      dynamicTools: [],
+      options: FULL_OPTIONS,
+    });
+    const otherProviderId = (started.result as { providerThreadId: string })
+      .providerThreadId;
+    await request("turn/start", {
+      threadId: otherThread,
+      providerThreadId: otherProviderId,
+      input: [{ type: "text", text: "hi", mentions: [] }],
+      clientRequestId: "creq_abcdefgh7a",
+      options: FULL_OPTIONS,
+    });
+    await waitFor(() => boundary("completed"));
+    const later = harness.messages
+      .filter((message) => message.method === "thread/delta")
+      .map((message) => message.params as { threadId: string });
+    // Everything emitted after the stop belongs to the other thread only.
+    expect(
+      later.slice(staleCount).every((params) => params.threadId === otherThread),
+    ).toBe(true);
   }, 10_000);
 
   it("fails the turn instead of finishing it when the model hits its length limit", async () => {
