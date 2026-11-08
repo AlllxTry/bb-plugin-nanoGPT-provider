@@ -64,6 +64,22 @@ key that NanoGPT accepts is saved, the provider offers **no models at all**.
 
 ## Quick start
 
+### Install from GitHub
+
+bb can install the plugin straight from Git. bb builds it on your machine, so you
+need no clone and no build step:
+
+```bash
+bb plugin install git:https://github.com/AlllxTry/bb-plugin-nanoGPT-provider.git@^0.1.0
+bb plugin update nanogpt-provider      # later, to pick up a newer release
+```
+
+The `@^0.1.0` part follows the repository's `vX.Y.Z` release tags, so
+`bb plugin update` only moves to compatible releases. Then continue with the
+steps under "Then, in bb" below.
+
+### Build from source
+
 ```bash
 # 1. Get the code and dependencies
 git clone https://github.com/AlllxTry/bb-plugin-nanoGPT-provider.git
