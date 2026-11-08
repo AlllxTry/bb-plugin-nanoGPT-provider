@@ -1,4 +1,4 @@
-﻿# bb-plugin-nano-gpt
+﻿# bb-plugin-nanoGPT-provider
 
 A [bb](https://github.com/get-bb/bb) **agent provider plugin** that connects bb to
 [NanoGPT](https://nano-gpt.com/api), one OpenAI-compatible API in front of
@@ -53,14 +53,14 @@ key that NanoGPT accepts is saved, the provider offers **no models at all**.
 | bb          | Desktop app or server with the plugin system and the `bb` CLI       |
 | Node.js     | 22.19 or newer, for tests and typecheck (bb bundles its own)        |
 | NanoGPT key | Create one at <https://nano-gpt.com/api>                            |
-| Plugin SDK  | `@get-bb/plugin-sdk` `>=0.6.0` (declared in `engines.bbPluginSdk`)  |
+| Plugin SDK  | `@get-bb/plugin-sdk` `>=0.6.133` (declared in `engines.bbPluginSdk`) |
 
 ## Quick start
 
 ```bash
 # 1. Get the code and dependencies
-git clone https://github.com/AlllxTry/bb-nanoGPT-plugin.git
-cd bb-nanoGPT-plugin
+git clone https://github.com/AlllxTry/bb-plugin-nanoGPT-provider.git
+cd bb-plugin-nanoGPT-provider
 npm install
 
 # 2. Make sure bb is running (start the desktop app, or your bb server)
@@ -74,11 +74,11 @@ Then, in bb:
 
 1. Open the **NanoGPT provider** plugin's settings.
 2. Paste your **NanoGPT API key**.
-3. Reload the plugin (`bb plugin reload nano-gpt`) or restart bb.
+3. Reload the plugin (`bb plugin reload nanogpt-provider`) or restart bb.
 4. Choose **NanoGPT** in the provider picker and pick a model.
 
 > **Plugin id.** bb derives it from the package name by dropping the
-> `bb-plugin-` prefix, so `bb-plugin-nano-gpt` becomes `nano-gpt`. That is the id
+> `bb-plugin-` prefix, so the package `bb-plugin-nanogpt-provider` becomes `nanogpt-provider`. That is the id
 > every `bb plugin ...` command in this README uses. `bb plugin list` shows it.
 
 > `bb` must be on your `PATH`. On Windows the desktop installer puts it at
@@ -94,11 +94,11 @@ All configuration lives in the plugin's bb settings. Use the settings UI, or the
 CLI:
 
 ```bash
-bb plugin config nano-gpt                         # show settings
-bb plugin config nano-gpt set apiKey sk-nano-...  # set the key
-bb plugin config nano-gpt set baseUrl https://api.nano-gpt.com/api/v1legacy
-bb plugin config nano-gpt unset baseUrl
-bb plugin reload nano-gpt
+bb plugin config nanogpt-provider                         # show settings
+bb plugin config nanogpt-provider set apiKey sk-nano-...  # set the key
+bb plugin config nanogpt-provider set baseUrl https://api.nano-gpt.com/api/v1legacy
+bb plugin config nanogpt-provider unset baseUrl
+bb plugin reload nanogpt-provider
 ```
 
 | Setting   | Type            | Default | Description                                                                              |
@@ -210,7 +210,7 @@ Notes:
 - `npm run build` and the other `bb plugin ...` scripts need the `bb` CLI on your
   `PATH`. Install and dev also need a running bb.
 - The plugin is installed **from its local path**. After editing sources, run
-  `npm run build` and `bb plugin reload nano-gpt`, or use `npm run dev` to do both
+  `npm run build` and `bb plugin reload nanogpt-provider`, or use `npm run dev` to do both
   on every change.
 - The SDK's test helpers import `better-sqlite3`, `cron-parser` and `hono`, so
   they are listed as dev dependencies. `better-sqlite3` needs its install script
@@ -249,7 +249,7 @@ test touches the network, because `fetch` is stubbed.
 | Client errors on reasoning output                    | Set `baseUrl` to `https://api.nano-gpt.com/api/v1legacy`.                                                         |
 | 402 or "No balance" errors                           | Your NanoGPT account is out of balance. Top it up on nano-gpt.com.                                                |
 
-Plugin logs: `bb plugin logs nano-gpt`.
+Plugin logs: `bb plugin logs nanogpt-provider`.
 
 ## Security notes
 

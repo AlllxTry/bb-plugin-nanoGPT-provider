@@ -1,7 +1,7 @@
-import type { PluginProviderFallbackModel } from "@get-bb/plugin-sdk";
+﻿import type { PluginProviderFallbackModel } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
-export const NANO_GPT_PLUGIN_ID = "nano-gpt";
+export const NANO_GPT_PLUGIN_ID = "nanogpt-provider";
 
 export const NANO_GPT_PROVIDER_ID = "nano-gpt";
 

@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+﻿import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import nanoGptPlugin from "./server.js";
 import {
@@ -8,7 +8,7 @@ import {
 } from "./src/vocabulary.js";
 
 function registeredDeclaration() {
-  const host = createFakePluginHost({ pluginId: "nano-gpt" });
+  const host = createFakePluginHost({ pluginId: "nanogpt-provider" });
   nanoGptPlugin(host.bb);
   const declaration = host.harness.registrations.providerRegistrations.find(
     (entry) => entry.id === NANO_GPT_PROVIDER_ID,
