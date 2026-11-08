@@ -335,11 +335,13 @@ Plugin logs: `bb plugin logs nanogpt-provider`.
 - The model list is capped at 400 entries, with a few preferred models first.
 - Model descriptions are generic, and context-window sizes are not reported.
 - Mobile and web clients have not been tested.
-- Checked in a live bb: the plugin installs and runs, the `nano-gpt` provider is
-  registered, the settings RPC answers, a rejected key is not saved, and the
-  picker offers no models with no key. Not checked: how the gear and the form
-  look and behave in the composer window, and anything that needs a real, valid
-  NanoGPT key (the live model list and a full turn).
+- Checked in a live bb (0.49.0, Windows): the plugin installs and runs, the
+  `nano-gpt` provider is registered, the gear and the settings form appear in the
+  composer, a rejected key is not saved, a real key is accepted by NanoGPT, and
+  the server then loads a catalog of 400 models. With no key the picker offers no
+  models. Not checked: a full chat turn against NanoGPT (streaming, reasoning and
+  tool calls) on a real key. Those paths are covered by unit tests with a stubbed
+  `fetch`, not by a live run.
 
 ## Author
 
