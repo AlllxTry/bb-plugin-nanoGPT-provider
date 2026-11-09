@@ -1,6 +1,6 @@
 # Reasoning Effort
 
-This guide describes the released implementation as of package version 0.1.6.
+This guide describes the released implementation as of package version 0.1.7.
 See [the changelog](../CHANGELOG.md) for the release boundary.
 
 ## Choosing an effort

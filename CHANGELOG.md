@@ -5,6 +5,12 @@ reads when you install or update the plugin.
 
 ## Unreleased
 
+_None yet. Release 0.1.7 is the current tagged release._
+
+## 0.1.7 — 2026-11-09
+
+### Retry safety
+
 - Cap server-directed `Retry-After` waits at 120 seconds for completion retries.
   A header beyond the cap fails the request immediately with the upstream status
   preserved instead of parking a turn for minutes or hours; waits within the cap
@@ -16,6 +22,9 @@ reads when you install or update the plugin.
   the request provably never reached the server; any other transport failure
   (reset socket, hang-up after send) fails the turn with an explanatory message
   instead of risking a billed duplicate request.
+
+### Context budget
+
 - Derive the input token budget from the model's advertised `context_length` when
   the detailed catalog provides a sane one (minus a 4,096-token output reserve,
   capped at ten million advertised tokens). Models without usable metadata keep
@@ -25,34 +34,50 @@ reads when you install or update the plugin.
   rejected, so multi-round tool use no longer fails at four 24 KB results.
   Eviction accounting is now incremental instead of re-estimating the whole
   history per eviction.
+
+### History restoration
+
 - Make history restoration self-healing. A corrupt or foreign checkpoint value in
   bb turn events now decodes to a legacy/no-checkpoint reconstruction instead of
   throwing, and one failed history read fails only its own turn: the sticky
   restoration requirement is cleared, so later turns on the same resumed thread
   continue with the current input instead of failing forever.
+
+### Streaming
+
 - Open a reasoning timeline item before streaming its first reasoning text delta
   (previously reasoning `textDelta`s had no preceding `item.open`), and stream the
   reasoning channel before the answer text when both arrive together.
 - Flush the streaming UTF-8 decoder when the SSE body ends so a trailing
   multi-byte character split across the final chunks is not dropped.
+
+### Model picker and settings
+
 - Report `model/list` failures to the host as a JSON-RPC error instead of a
   silently empty catalog, resolve the picker endpoint from provider options
   before env (matching turn requests), and drop the redundant unique-by-id pass.
-- Answer already-acknowledged queued follow-ups with a visible provider warning
-  when Stop drops them, instead of discarding them silently. A terminal boundary
-  is deliberately not emitted for them because it would corrupt the history
-  collector's turn grouping.
 - Tolerate a saved base URL that is not a valid endpoint (for example one saved
   through a path this plugin does not validate): `getStatus`, env contribution
   and provider-option derivation ignore it with a log line and fall back to the
   default endpoint instead of failing.
+
+### Turn lifecycle
+
+- Answer already-acknowledged queued follow-ups with a visible provider warning
+  when Stop drops them, instead of discarding them silently. A terminal boundary
+  is deliberately not emitted for them because it would corrupt the history
+  collector's turn grouping.
 - Separate adjacent text parts in a prompt (message + attached file, or two
   attachments) with blank lines in the live path and in restored history, so
   they cannot fuse into one another.
-- Verification: 290 tests across 13 files pass, including new regressions for
-  the retry cap, the no-replay rule, catalog context windows, in-turn tool
-  compaction, the restoration retry-clear, reasoning item opening, model/list
-  error reporting and endpoint resolution; `tsc --noEmit` passes.
+
+### Verification
+
+- 290 tests across 13 files pass, including new regressions for the retry cap,
+  the no-replay rule, catalog context windows, in-turn tool compaction, the
+  restoration retry-clear, reasoning item opening, model/list error reporting
+  and endpoint resolution, the dropped follow-up warning, and tolerant saved
+  base-URL status; `tsc --noEmit` passes.
 
 ## 0.1.6 — 2026-11-09
 

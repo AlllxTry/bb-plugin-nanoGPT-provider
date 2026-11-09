@@ -152,6 +152,6 @@ deadline. See `docs/REASONING_EFFORT.md` for the complete behavior and open chec
 
 Reasoning overrides and history restoration are part of release 0.1.6; the
 retry, context-budget, restoration-retry and reasoning-stream fixes described
-above are unreleased source-tree changes. Do not claim either for an older
-tagged installation without checking its version/source. Synthetic tests do not
+above are part of release 0.1.7. Do not claim either for an older tagged
+installation without checking its version/source. Synthetic tests do not
 establish live composer/API compatibility.
