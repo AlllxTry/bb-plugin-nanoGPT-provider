@@ -45,6 +45,144 @@ async function collect(
 }
 
 describe("streamChatCompletion", () => {
+  describe("retries", () => {
+    const successfulResponse = async () => sseResponse(chunk({ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }));
+
+    it.each([429, 502, 503, 504].flatMap((status) => [
+      { status, retryAfter: "60" },
+      { status, retryAfter: "Mon, 09 Nov 2026 00:01:00 GMT" },
+    ]))("honors Retry-After $retryAfter on HTTP $status", async ({ status, retryAfter }) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-11-09T00:00:00Z"));
+      const fetch = vi.fn()
+        .mockResolvedValueOnce(new Response("wait", { status, headers: { "Retry-After": retryAfter } }))
+        .mockImplementation(successfulResponse);
+      const pending = collect(createNanoGptClient({ apiKey: "test", fetch }).streamChatCompletion({ model: "test", messages: [] }));
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).resolves.toContainEqual(expect.objectContaining({ type: "message", content: "ok" }));
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each(["invalid", "-1", "1.5", "10seconds", ""])("falls back to backoff for malformed Retry-After %j", async (retryAfter) => {
+      vi.useFakeTimers();
+      const fetch = vi.fn()
+        .mockResolvedValueOnce(new Response("wait", { status: 429, headers: { "Retry-After": retryAfter } }))
+        .mockImplementation(successfulResponse);
+      const pending = collect(createNanoGptClient({ apiKey: "test", fetch }).streamChatCompletion({ model: "test", messages: [] }));
+      await vi.advanceTimersByTimeAsync(1499);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1001);
+      await pending;
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("preserves the final upstream status and message after exhausting retries", async () => {
+      vi.useFakeTimers();
+      const fetch = vi.fn().mockImplementation(async () => jsonResponse({ error: { message: "Service busy" } }, 503))
+        .mockImplementationOnce(async () => jsonResponse({ error: { message: "Earlier error" } }, 502))
+        .mockImplementationOnce(async () => jsonResponse({ error: { message: "Earlier error" } }, 502))
+        .mockImplementationOnce(async () => jsonResponse({ error: { message: "Earlier error" } }, 502));
+      const pending = collect(createNanoGptClient({ apiKey: "test", fetch }).streamChatCompletion({ model: "test", messages: [] }));
+      const assertion = expect(pending).rejects.toMatchObject({
+        name: "NanoGptApiError", status: 503,
+        message: expect.stringMatching(/NanoGPT API error 503: Service busy.*4 attempts/),
+      });
+      await vi.runAllTimersAsync();
+      await assertion;
+      expect(fetch).toHaveBeenCalledTimes(4);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("cancels a long Retry-After wait without sending another request", async () => {
+      vi.useFakeTimers();
+      const controller = new AbortController();
+      const fetch = vi.fn(async () => new Response("wait", { status: 503, headers: { "Retry-After": "60" } }));
+      const pending = collect(createNanoGptClient({ apiKey: "test", fetch }).streamChatCompletion({ model: "test", messages: [], signal: controller.signal }));
+      const assertion = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      await vi.advanceTimersByTimeAsync(1000);
+      controller.abort();
+      await assertion;
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("honors Retry-After delays beyond the Node.js timer limit", async () => {
+      vi.useFakeTimers();
+      const fetch = vi.fn()
+        .mockResolvedValueOnce(new Response("wait", { status: 429, headers: { "Retry-After": "2147484" } }))
+        .mockImplementation(successfulResponse);
+      const pending = collect(createNanoGptClient({ apiKey: "test", fetch }).streamChatCompletion({ model: "test", messages: [] }));
+      await vi.advanceTimersByTimeAsync(2_147_483_647);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(352);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each(["0", "Sun, 08 Nov 2026 00:00:00 GMT"])("does not add backoff for Retry-After %j", async (retryAfter) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-11-09T00:00:00Z"));
+      const fetch = vi.fn()
+        .mockResolvedValueOnce(new Response("wait", { status: 503, headers: { "Retry-After": retryAfter } }))
+        .mockImplementation(successfulResponse);
+      const pending = collect(createNanoGptClient({ apiKey: "test", fetch }).streamChatCompletion({ model: "test", messages: [] }));
+      await vi.advanceTimersByTimeAsync(0);
+      await pending;
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("uses local backoff after a network failure instead of an earlier Retry-After", async () => {
+      vi.useFakeTimers();
+      const fetch = vi.fn()
+        .mockResolvedValueOnce(new Response("wait", { status: 429, headers: { "Retry-After": "60" } }))
+        .mockRejectedValueOnce(new TypeError("Connection reset"))
+        .mockImplementation(successfulResponse);
+      const pending = collect(createNanoGptClient({ apiKey: "test", fetch }).streamChatCompletion({ model: "test", messages: [] }));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(3499);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1001);
+      await pending;
+      expect(fetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("does not retry non-transient HTTP errors", async () => {
+      const fetch = vi.fn(async () => jsonResponse({ error: { message: "Invalid key" } }, 401));
+      await expect(collect(createNanoGptClient({ apiKey: "test", fetch }).streamChatCompletion({ model: "test", messages: [] })))
+        .rejects.toMatchObject({ status: 401, message: "NanoGPT API error 401: Invalid key" });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("sends the selected reasoning effort as a top-level field and omits it by default", async () => {
+    for (const effort of ["low", "medium", "high"] as const) {
+      let requestBody: Record<string, unknown> | undefined;
+      const client = createNanoGptClient({ apiKey: "test", fetch: async (_url, init) => {
+        requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return sseResponse(chunk({ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }));
+      } });
+      await collect(client.streamChatCompletion({ model: "test", messages: [], reasoningEffort: effort }));
+      expect(requestBody?.reasoning_effort).toBe(effort);
+      expect(requestBody?.reasoning).toBeUndefined();
+    }
+
+    let defaultBody: Record<string, unknown> | undefined;
+    const defaultClient = createNanoGptClient({ apiKey: "test", fetch: async (_url, init) => {
+      defaultBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return sseResponse(chunk({ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }));
+    } });
+    await collect(defaultClient.streamChatCompletion({ model: "test", messages: [] }));
+    expect(defaultBody?.reasoning_effort).toBeUndefined();
+  });
+
   it.each([" ", "a\nb", "a".repeat(513)])("rejects invalid model IDs before fetch", async (model) => {
     const fetch = vi.fn();
     const client = createNanoGptClient({ apiKey: "test", fetch });
@@ -493,6 +631,40 @@ describe("listModels", () => {
     await expect(client.listModels()).resolves.toEqual([
       "openai/gpt-6.1-sol",
       "z-ai/glm-5.3",
+    ]);
+  });
+
+  it("reads model-specific efforts from detailed catalog metadata", async () => {
+    const urls: string[] = [];
+    const client = createNanoGptClient({ apiKey: "sk-nano-test", fetch: async (url) => {
+      urls.push(String(url));
+      return jsonResponse({ data: [
+        { id: "model/a", reasoning_efforts: ["low", "medium", "high"] },
+        { id: "model/b" },
+        { id: "model/c", reasoning_efforts: [] },
+      ] });
+    } });
+    await expect(client.listModelCatalog()).resolves.toEqual([
+      { id: "model/a", reasoningEfforts: ["low", "medium", "high"] },
+      { id: "model/b", reasoningEfforts: undefined },
+      { id: "model/c", reasoningEfforts: [] },
+    ]);
+    expect(urls).toEqual([`${NANO_GPT_DEFAULT_BASE_URL}/models?detailed=true`]);
+  });
+
+  it("falls back to ID-only discovery only when detailed mode is unsupported", async () => {
+    const urls: string[] = [];
+    const client = createNanoGptClient({ apiKey: "test", fetch: async (url) => {
+      urls.push(String(url));
+      if (urls.length === 1) return jsonResponse({ message: "detailed is not supported" }, 400);
+      return jsonResponse({ data: [{ id: "model/a", reasoning_efforts: ["high"] }] });
+    } });
+    await expect(client.listModelCatalog()).resolves.toEqual([
+      { id: "model/a", reasoningEfforts: undefined },
+    ]);
+    expect(urls).toEqual([
+      `${NANO_GPT_DEFAULT_BASE_URL}/models?detailed=true`,
+      `${NANO_GPT_DEFAULT_BASE_URL}/models`,
     ]);
   });
 

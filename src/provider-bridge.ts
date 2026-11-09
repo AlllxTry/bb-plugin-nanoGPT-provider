@@ -27,19 +27,36 @@ import {
   turnStartParamsSchema,
   turnSteerParamsSchema,
 } from "@get-bb/plugin-sdk/provider-bridge";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { describeAttachedFile, readAttachedImage, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES } from "./attachments.js";
 import { normalizeBaseUrl } from "./base-url.js";
 import { boundedHistoryText, estimateTextTokens, fitContext } from "./context.js";
+import { restoreNanoGptHistory } from "./history-adapter.js";
+import {
+  HISTORY_TOOL_NAME,
+  MAX_HISTORY_PAGES,
+  historyPageSchema,
+  encodeContextCheckpoint,
+  INPUT_NOT_RETAINED_NOTICE,
+} from "./history-protocol.js";
 import {
   type NanoGptContentPart,
   type NanoGptMessage,
+  type NanoGptModelCatalogEntry,
   type NanoGptToolCall,
   type NanoGptToolDefinition,
   NanoGptApiError,
   createNanoGptClient,
 } from "./nano-gpt-client.js";
+import {
+  normalizeReasoningEfforts,
+  reasoningOptions,
+  resolveReasoningSelection,
+  validateReasoningSelection,
+  type NanoGptReasoningEffort,
+  type NanoGptReasoningSelection,
+} from "./reasoning.js";
 import {
   MAX_TOOL_ROUNDS,
   NANO_GPT_API_KEY_ENV,
@@ -76,6 +93,7 @@ interface Session {
   usageTotal: ThreadEventTokenUsageBreakdown;
   activeTurn: ActiveTurn | null;
   queue: QueuedPrompt[];
+  restorationRequired: boolean;
 }
 
 interface OpenTool {
@@ -86,6 +104,7 @@ interface OpenTool {
 
 /** Everything a turn has opened in the timeline, so it can always be closed. */
 interface ActiveTurn {
+  clientRequestId: string | null;
   controller: AbortController;
   done: Promise<void>;
   /** True once the turn has sent its single terminal `turn.boundary`. */
@@ -101,12 +120,73 @@ interface ActiveTurn {
 
 interface TurnOptions {
   model: string | undefined;
+  reasoningLevel: string | undefined;
   instructions: string | undefined;
   providerOptions: unknown;
   envVars: Record<string, string> | undefined;
 }
 
 const sessions = new Map<string, Session>();
+
+const MODEL_CATALOG_TTL_MS = 5 * 60_000;
+const MODEL_CATALOG_MAX_ENTRIES = 16;
+const modelCatalogCache = new Map<string, {
+  expiresAt: number;
+  entries: Map<string, NanoGptModelCatalogEntry>;
+}>();
+
+function modelCatalogCacheKey(url: string, key: string): string {
+  return createHash("sha256").update(`${url}\n${key}`).digest("hex");
+}
+
+function invalidateModelCatalog(url: string, key: string): void {
+  modelCatalogCache.delete(modelCatalogCacheKey(url, key));
+}
+
+async function modelCatalog(
+  client: ReturnType<typeof createNanoGptClient>,
+  url: string,
+  key: string,
+  signal?: AbortSignal,
+  refresh = false,
+): Promise<Map<string, NanoGptModelCatalogEntry>> {
+  const cacheKey = modelCatalogCacheKey(url, key);
+  const now = Date.now();
+  const cached = modelCatalogCache.get(cacheKey);
+  if (!refresh && cached !== undefined && cached.expiresAt > now) {
+    modelCatalogCache.delete(cacheKey);
+    modelCatalogCache.set(cacheKey, cached);
+    return cached.entries;
+  }
+  if (cached !== undefined) modelCatalogCache.delete(cacheKey);
+  const records = await client.listModelCatalog(signal);
+  const result = new Map<string, NanoGptModelCatalogEntry>();
+  for (const record of records) {
+    const previous = result.get(record.id);
+    if (previous === undefined) result.set(record.id, record);
+    else if (JSON.stringify(previous.reasoningEfforts) !== JSON.stringify(record.reasoningEfforts)) {
+      result.set(record.id, { id: record.id, reasoningEfforts: undefined });
+    }
+  }
+  modelCatalogCache.set(cacheKey, { expiresAt: Date.now() + MODEL_CATALOG_TTL_MS, entries: result });
+  while (modelCatalogCache.size > MODEL_CATALOG_MAX_ENTRIES) {
+    const oldest = modelCatalogCache.keys().next().value;
+    if (oldest === undefined) break;
+    modelCatalogCache.delete(oldest);
+  }
+  return result;
+}
+
+function catalogEfforts(entry: NanoGptModelCatalogEntry | undefined): NanoGptReasoningEffort[] {
+  return normalizeReasoningEfforts(entry?.reasoningEfforts);
+}
+
+function assertModelEffort(
+  selection: NanoGptReasoningSelection,
+  entry: NanoGptModelCatalogEntry | undefined,
+): NanoGptReasoningSelection {
+  return validateReasoningSelection(selection, catalogEfforts(entry));
+}
 
 type JsonRpcId = string | number;
 
@@ -168,6 +248,7 @@ function openSession(args: {
   providerThreadId: string;
   cwd: string;
   dynamicTools: readonly DynamicTool[] | undefined;
+  restorationRequired: boolean;
 }): Session {
   const previous = sessions.get(args.threadId);
   if (previous !== undefined) {
@@ -190,6 +271,7 @@ function openSession(args: {
     usageTotal: ZERO_TOKEN_USAGE,
     activeTurn: null,
     queue: [],
+    restorationRequired: args.restorationRequired,
   };
   sessions.set(args.threadId, session);
   notify(BRIDGE_NOTIFICATION_METHODS.threadIdentity, {
@@ -268,7 +350,7 @@ function setSystemMessage(session: Session, options: TurnOptions, planMode: bool
 }
 
 function toolDefinitions(session: Session): NanoGptToolDefinition[] {
-  return [...session.tools.values()].map((tool) => ({
+  return [...session.tools.values()].filter((tool) => tool.name !== HISTORY_TOOL_NAME).map((tool) => ({
     type: "function" as const,
     function: {
       name: tool.name,
@@ -276,6 +358,60 @@ function toolDefinitions(session: Session): NanoGptToolDefinition[] {
       parameters: tool.inputSchema,
     },
   }));
+}
+
+async function restoreSessionHistory(
+  session: Session,
+  currentRequestId: ClientTurnRequestId | undefined,
+  signal: AbortSignal,
+): Promise<void> {
+  const rows: unknown[] = [];
+  let afterSeq: number | null = null;
+  let throughSeq: number | null = null;
+  for (let pageNumber = 0; pageNumber < MAX_HISTORY_PAGES; pageNumber += 1) {
+    signal.throwIfAborted();
+    const result = await requestToolCall(
+      session,
+      `nano-gpt-history-${pageNumber}`,
+      HISTORY_TOOL_NAME,
+      { afterSeq, throughSeq, currentRequestId: currentRequestId ?? null },
+      signal,
+    );
+    if (result.isError) throw new Error(`bb history could not be loaded: ${result.content}`);
+    let envelope: unknown;
+    try {
+      envelope = JSON.parse(result.content);
+    } catch {
+      throw new Error("bb history returned an invalid page.");
+    }
+    const parsed = historyPageSchema.safeParse(envelope);
+    if (!parsed.success || parsed.data.threadId !== session.threadId) {
+      throw new Error("bb history returned a malformed page or a different thread.");
+    }
+    if (throughSeq !== null && parsed.data.throughSeq !== throughSeq) {
+      throw new Error("bb history changed during restoration.");
+    }
+    throughSeq = parsed.data.throughSeq;
+    rows.push(...parsed.data.events);
+    if (parsed.data.nextAfterSeq === null) {
+      signal.throwIfAborted();
+      const restored = restoreNanoGptHistory(rows, {
+        ...(currentRequestId === undefined ? {} : { currentRequestId }),
+      });
+      const systemMessages = session.messages[0]?.role === "system" ? 1 : 0;
+      session.messages.splice(systemMessages, 0, ...restored.messages);
+      session.completedTurnEnds.push(
+        ...restored.completedTurnEnds.map((end) => end + systemMessages),
+      );
+      session.restorationRequired = false;
+      return;
+    }
+    if (afterSeq !== null && parsed.data.nextAfterSeq <= afterSeq) {
+      throw new Error("bb history returned a non-advancing page cursor.");
+    }
+    afterSeq = parsed.data.nextAfterSeq;
+  }
+  throw new Error("bb history exceeds the supported restoration limit.");
 }
 
 type ParsedToolArguments =
@@ -369,6 +505,7 @@ function abortError(): DOMException {
 
 function newActiveTurn(): ActiveTurn {
   return {
+    clientRequestId: null,
     controller: new AbortController(),
     done: Promise.resolve(),
     settled: false,
@@ -445,6 +582,10 @@ function settleTurn(
     });
   }
   turn.unansweredToolCalls = [];
+  const providerCheckpointId = encodeContextCheckpoint({
+    requestId: turn.clientRequestId,
+    inputRetained: turn.historyStart !== null && session.messages.length > turn.historyStart,
+  });
   if (turn.historyStart !== null && session.messages.length > turn.historyStart) {
     session.completedTurnEnds.push(session.messages.length);
   }
@@ -457,16 +598,17 @@ function settleTurn(
         last: outcome.usage,
         modelContextWindow: null,
       },
-      { kind: "turn.boundary", status: "completed" },
+      { kind: "turn.boundary", status: "completed", providerCheckpointId },
     );
   } else if (outcome.status === "interrupted") {
-    deltas.push({ kind: "turn.boundary", status: "interrupted" });
+    deltas.push({ kind: "turn.boundary", status: "interrupted", providerCheckpointId });
   } else {
     deltas.push(
       { kind: "provider.error", message: outcome.message },
       {
         kind: "turn.boundary",
         status: "failed",
+        providerCheckpointId,
         error: { message: outcome.message },
       },
     );
@@ -577,6 +719,7 @@ async function runTurnWork(
   const { session } = args;
   const signal = turn.controller.signal;
   const threadId = session.threadId;
+  turn.clientRequestId = args.clientRequestId ?? null;
   session.turnCounter += 1;
 
   // Nothing may be emitted once the turn has settled (for example after a
@@ -608,21 +751,31 @@ async function runTurnWork(
   let hasModelProgress = false;
   // Usage is summed over every model round of the turn.
   let turnUsage: ThreadEventTokenUsageBreakdown = ZERO_TOKEN_USAGE;
+  let requestBaseUrl = "";
+  let reasoningEffort: NanoGptReasoningEffort | undefined;
 
   try {
     const model = modelId(args.options);
+    const reasoningSelection = resolveReasoningSelection(args.options.reasoningLevel);
     const providerOptions = nanoGptProviderOptionsSchema.partial().parse(args.options.providerOptions);
+    requestBaseUrl = baseUrl(args.options.providerOptions, args.options.envVars);
+    const client = createNanoGptClient({ baseUrl: requestBaseUrl, apiKey: key });
+    if (reasoningSelection.kind === "explicit") {
+      const catalog = await modelCatalog(client, requestBaseUrl, key, signal);
+      assertModelEffort(reasoningSelection, catalog.get(model));
+      reasoningEffort = reasoningSelection.effort;
+    }
     const planMode = providerOptions.promptMode === "plan";
     setSystemMessage(session, args.options, planMode);
+    if (session.restorationRequired) {
+      await restoreSessionHistory(session, args.clientRequestId, signal);
+      if (turn.settled || signal.aborted) throw abortError();
+    }
     historyMark = session.messages.length;
     turn.historyStart = historyMark;
     const content = await userContent(args.input, signal);
     if (turn.settled || signal.aborted) throw abortError();
     session.messages.push({ role: "user", content });
-    const client = createNanoGptClient({
-      baseUrl: baseUrl(args.options.providerOptions, args.options.envVars),
-      apiKey: key,
-    });
     const tools = planMode ? [] : toolDefinitions(session);
     let rounds = 0;
     while (true) {
@@ -648,6 +801,7 @@ async function runTurnWork(
         model,
         messages: session.messages,
         tools: tools.length > 0 ? tools : undefined,
+        reasoningEffort,
         signal,
       });
 
@@ -866,6 +1020,10 @@ async function runTurnWork(
     settleTurn(session, turn, { status: "completed", usage: turnUsage });
   } catch (error) {
     if (turn.settled) return;
+    if (reasoningEffort !== undefined && error instanceof NanoGptApiError &&
+        error.status === 400 && /reason|effort|thinking/i.test(error.message)) {
+      invalidateModelCatalog(requestBaseUrl, key);
+    }
     if (turn.messageText !== "") {
       session.messages.push({ role: "assistant", content: boundedHistoryText(turn.messageText) });
       hasModelProgress = true;
@@ -882,7 +1040,7 @@ async function runTurnWork(
     const detail = error instanceof Error ? error.message : String(error);
     settleTurn(session, turn, {
       status: "failed",
-      message: detail + (discardedInput ? " This input was not kept in the model history; revise it and try again." : ""),
+      message: detail + (discardedInput ? INPUT_NOT_RETAINED_NOTICE : ""),
     });
   }
 }
@@ -922,12 +1080,14 @@ function healthResult(): ProviderHealthResult {
 
 function turnOptionsOf(options: {
   model?: string;
+  reasoningLevel?: string;
   instructions?: string;
   providerOptions?: Record<string, unknown>;
   envVars?: Record<string, string>;
 }): TurnOptions {
   return {
     model: options.model,
+    reasoningLevel: options.reasoningLevel,
     instructions: options.instructions,
     providerOptions: options.providerOptions ?? {},
     envVars: options.envVars,
@@ -947,9 +1107,7 @@ const handlers: Record<string, RequestHandler> = {
       protocolVersion: PROVIDER_BRIDGE_PROTOCOL_VERSION,
       capabilities: {
         grammarVersions: [THREAD_DELTA_GRAMMAR_V3],
-        // The bridge keeps conversation history in memory only, so it cannot
-        // restore a session after a restart. Do not claim otherwise.
-        sessionRestore: false,
+        sessionRestore: true,
         threadArchive: false,
         threadRename: false,
         threadGoalClear: false,
@@ -973,10 +1131,13 @@ const handlers: Record<string, RequestHandler> = {
         return;
       }
       try {
-        const ids = await createNanoGptClient({
-          baseUrl: baseUrl(undefined, parsed.data.envVars),
+        const requestBaseUrl = baseUrl(undefined, parsed.data.envVars);
+        const client = createNanoGptClient({
+          baseUrl: requestBaseUrl,
           apiKey: key,
-        }).listModels();
+        });
+        const catalog = await modelCatalog(client, requestBaseUrl, key, undefined, true);
+        const ids = [...catalog.keys()];
         const preferred = new Map(
           NANO_GPT_FALLBACK_MODELS.map((model, index) => [model.id, index]),
         );
@@ -985,17 +1146,21 @@ const handlers: Record<string, RequestHandler> = {
           return ((preferred.get(left) ?? Infinity) - (preferred.get(right) ?? Infinity)) || left.localeCompare(right);
         });
         const defaultId = unique.includes(NANO_GPT_DEFAULT_MODEL_ID) ? NANO_GPT_DEFAULT_MODEL_ID : unique[0];
-        const models = unique.map((modelId) => ({
-          id: modelId,
-          model: modelId,
-          displayName: modelDisplayName(modelId),
-          description: "Chat model routed through NanoGPT.",
-          supportedReasoningEfforts: [
-            { reasoningEffort: "medium", label: "Provider default", description: "Use the upstream model's default reasoning." },
-          ],
-          defaultReasoningEffort: "medium",
-          isDefault: modelId === defaultId,
-        }));
+        const models = unique.map((id) => {
+          const options = reasoningOptions(catalogEfforts(catalog.get(id)));
+          return {
+            id,
+            model: id,
+            displayName: modelDisplayName(id),
+            description: "Chat model routed through NanoGPT.",
+            reasoningDiscovery: Array.isArray(catalog.get(id)?.reasoningEfforts) &&
+              (catalog.get(id)?.reasoningEfforts as unknown[]).every((effort) => typeof effort === "string")
+              ? "known" as const : "unknown" as const,
+            supportedReasoningEfforts: options.map(({ reasoningEffort, label, description }) => ({ reasoningEffort, label, description })),
+            defaultReasoningEffort: options[0]!.reasoningEffort,
+            isDefault: id === defaultId,
+          };
+        });
         io.sendResult(id, { models, selectedOnlyModels: [] });
       } catch {
         io.sendResult(id, { models: [], selectedOnlyModels: [] });
@@ -1033,8 +1198,9 @@ const handlers: Record<string, RequestHandler> = {
       providerThreadId,
       cwd: parsed.data.cwd,
       dynamicTools: parsed.data.dynamicTools,
+      restorationRequired: false,
     });
-    io.sendResult(id, { providerThreadId, sessionRestorable: false });
+    io.sendResult(id, { providerThreadId, sessionRestorable: true });
     if (parsed.data.input !== undefined && parsed.data.input.length > 0) {
       runTurn({
         session,
@@ -1061,10 +1227,11 @@ const handlers: Record<string, RequestHandler> = {
       providerThreadId: parsed.data.providerThreadId,
       cwd: parsed.data.cwd,
       dynamicTools: parsed.data.dynamicTools,
+      restorationRequired: true,
     });
     io.sendResult(id, {
       providerThreadId: parsed.data.providerThreadId,
-      sessionRestorable: false,
+      sessionRestorable: true,
     });
   },
 

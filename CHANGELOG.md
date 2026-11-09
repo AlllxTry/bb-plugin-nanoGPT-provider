@@ -3,6 +3,28 @@
 All notable changes to this plugin. Versions follow the `vX.Y.Z` git tags that bb
 reads when you install or update the plugin.
 
+## Unreleased
+
+- Honor `Retry-After` seconds and HTTP dates for every retryable completion
+  status (429, 502, 503, 504), keep long waits cancellable without timer overflow,
+  and use local backoff after a subsequent transport failure. Exhausted HTTP
+  retries preserve the final upstream status/message and include the attempt
+  count. Add retry regression coverage and document the retry policy.
+- Add model-specific Low, Medium, and High reasoning effort choices when NanoGPT
+  declares support. Explicit choices are validated and sent as `reasoning_effort`;
+  Provider default omits the field and preserves the old saved `medium` behavior.
+- Restore NanoGPT model context from bb's saved event history after provider
+  session resume. History is fetched through a bounded hidden tool before the
+  first model request; failed retrieval fails the turn instead of silently
+  continuing with empty context. URL images are restored; historical local
+  attachment bytes and original model tool-call IDs are not available.
+- Add history-adapter and resume-bridge coverage. Live daemon restart verification
+  remains outstanding.
+- Restore queued prompts in execution order and preserve accepted retry inputs.
+  Record request identity and input retention in bb turn checkpoints so rolled-back
+  input and canceled queued prompts stay excluded after resume. Retained failed
+  and interrupted turns can be evicted together with their tool results.
+
 ## 0.1.4 — 2026-11-09
 
 - Interrupting a turn preserves its session and conversation history, including

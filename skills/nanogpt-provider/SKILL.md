@@ -61,9 +61,12 @@ permission denied. Local PNG/JPEG/GIF/WebP images are sent as data URLs: up to
 Use `/plan` for a planning turn. The bridge sends a planning instruction and no
 tool definitions, and also rejects unexpected tool calls in the response. A
 subsequent ordinary turn can use the tools registered by bb again. Unknown tool
-names are never forwarded to bb. Reasoning effort uses Provider default; the
-plugin does not expose ineffective low/medium/high controls or send unverified
-effort parameters across all routed models.
+names are never forwarded to bb. Reasoning defaults to Provider default. The
+live catalog exposes Low, Medium, or High only when NanoGPT declares that
+effort for the selected model. Explicit selections are validated before the
+request and sent as `reasoning_effort`; Provider default omits the field. Old
+saved `medium` selections keep their former Provider default meaning. If a
+model's capabilities cannot be verified, Provider default remains available.
 
 ## Errors the user may see
 

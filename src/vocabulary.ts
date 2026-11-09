@@ -2,6 +2,7 @@ import type { PluginProviderFallbackModel } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
 import { NANO_GPT_PROVIDER_ID } from "./provider-id.js";
+import { PROVIDER_DEFAULT_REASONING_LEVEL } from "./reasoning.js";
 
 export { NANO_GPT_PROVIDER_ID };
 
@@ -33,9 +34,9 @@ function fallbackModel(
     displayName,
     description,
     supportedReasoningEfforts: [
-      { reasoningEffort: "medium", label: "Provider default", description: "Use the upstream model's default reasoning." },
+      { reasoningEffort: PROVIDER_DEFAULT_REASONING_LEVEL, label: "Provider default", description: "Use the upstream model's default reasoning." },
     ],
-    defaultReasoningEffort: "medium",
+    defaultReasoningEffort: PROVIDER_DEFAULT_REASONING_LEVEL,
     isDefault,
   };
 }

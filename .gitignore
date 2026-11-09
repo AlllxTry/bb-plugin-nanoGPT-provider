@@ -9,4 +9,4 @@ coverage/
 .env.*
 *.log
 .DS_Store
-PLAN_PERSISTENCE.md
+/dev_docs/

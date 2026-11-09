@@ -12,6 +12,15 @@ import {
   NANO_GPT_PROVIDER_ID,
   type NanoGptProviderOptions,
 } from "./src/vocabulary.js";
+import {
+  NANO_GPT_REASONING_EFFORTS,
+  PROVIDER_DEFAULT_REASONING_LEVEL,
+} from "./src/reasoning.js";
+import {
+  HISTORY_PAGE_SIZE,
+  HISTORY_TOOL_NAME,
+  historyPageRequestSchema,
+} from "./src/history-protocol.js";
 
 export { nanoGptSettingsContract };
 
@@ -19,6 +28,63 @@ const SETUP_HINT =
   "Click the gear in the composer, or open the NanoGPT provider plugin settings, and paste an API key from https://nano-gpt.com/api.";
 
 export default function plugin(bb: BbPluginApi) {
+  bb.agents.registerTool({
+    name: HISTORY_TOOL_NAME,
+    description: "Read a page of this thread's saved conversation events for provider context restoration.",
+    parameters: historyPageRequestSchema,
+    presentation: {
+      label: { pending: "Restoring conversation context", completed: "Conversation context restored" },
+      icon: { glyph: "History" },
+      suppress: true,
+    },
+    async execute(args, context) {
+      context.signal.throwIfAborted();
+      let throughSeq = args.throughSeq;
+      if (throughSeq === null) {
+        const latest = await bb.sdk.threads.events.list({
+          threadId: context.threadId,
+          order: "desc",
+          limit: "1",
+          signal: context.signal,
+        });
+        throughSeq = latest[0]?.seq ?? 0;
+      }
+      const rows = await bb.sdk.threads.events.list({
+        threadId: context.threadId,
+        ...(args.afterSeq === null ? {} : { afterSeq: String(args.afterSeq) }),
+        beforeSeq: String(throughSeq + 1),
+        limit: String(HISTORY_PAGE_SIZE),
+        order: "asc",
+        types: [
+          "client/turn/requested",
+          "turn/input/accepted",
+          "turn/started",
+          "turn/completed",
+          "item/completed",
+          "system/operation",
+          "thread/context/cleared",
+        ],
+        signal: context.signal,
+      });
+      context.signal.throwIfAborted();
+      const nextAfterSeq = rows.length === HISTORY_PAGE_SIZE
+        ? rows.at(-1)?.seq ?? null
+        : null;
+      return JSON.stringify({
+        version: 1,
+        threadId: context.threadId,
+        throughSeq,
+        nextAfterSeq,
+        events: rows,
+      });
+    },
+  });
+
+  bb.agents.configure((context) => ({
+    tools: context.provider.id === NANO_GPT_PROVIDER_ID ? [HISTORY_TOOL_NAME] : [],
+    skills: [],
+  }));
+
   const settings = bb.settings.define({
     apiKey: {
       type: "string",
@@ -147,7 +213,12 @@ export default function plugin(bb: BbPluginApi) {
       reasoningLevels: ["medium"],
     },
     reasoningLevels: [
-      { id: "medium", label: "Provider default", description: "Reasoning is controlled by the upstream model; effort overrides are not supported." },
+      { id: PROVIDER_DEFAULT_REASONING_LEVEL, label: "Provider default", description: "Let the selected NanoGPT model use its default reasoning behavior." },
+      ...NANO_GPT_REASONING_EFFORTS.map((effort) => ({
+        id: `nanogpt:effort:${effort}`,
+        label: effort[0]!.toUpperCase() + effort.slice(1),
+        description: `Request ${effort} reasoning effort when supported by the selected NanoGPT model.`,
+      })),
     ],
     composerActions: ["plan"],
     models: { fallback: [], scope: "host" },

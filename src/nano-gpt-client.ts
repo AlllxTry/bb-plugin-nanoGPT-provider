@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { normalizeBaseUrl } from "./base-url.js";
 import { nanoGptModelIdSchema, normalizeModelId, RETRY_CONFIG } from "./vocabulary.js";
+import type { NanoGptReasoningEffort } from "./reasoning.js";
 
 const debug = process.env.NANOGPT_DEBUG === "1" ? console.error : () => undefined;
 
@@ -136,12 +137,19 @@ function isRetryableStatus(status: number): boolean {
 
 /** Calculate delay for next retry with exponential backoff and jitter. */
 function calculateRetryDelay(attempt: number, response: Response | null): number {
-  // Check for Retry-After header on 429
-  if (response?.status === 429) {
-    const retryAfter = response.headers.get("Retry-After");
-    if (retryAfter !== null) {
-      const seconds = Number.parseInt(retryAfter, 10);
-      if (!Number.isNaN(seconds)) return seconds * 1000;
+  // Retry-After overrides local backoff for any retryable HTTP response.
+  if (response !== null && isRetryableStatus(response.status)) {
+    const retryAfter = response.headers.get("Retry-After")?.trim();
+    if (retryAfter !== undefined) {
+      if (/^\d+$/u.test(retryAfter)) {
+        const delay = Number(retryAfter) * 1000;
+        if (Number.isSafeInteger(delay)) return delay;
+      } else if (/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/u.test(retryAfter)) {
+        // Require a weekday prefix so Date.parse cannot interpret malformed
+        // delay-seconds such as "-1" or "1.5" as calendar dates.
+        const date = Date.parse(retryAfter);
+        if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+      }
     }
   }
   // Exponential backoff: baseDelay * 2^attempt
@@ -155,14 +163,26 @@ function calculateRetryDelay(attempt: number, response: Response | null): number
 /** Sleep for specified ms, respecting abort signal. */
 async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) throw abortError();
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
-    if (signal) {
-      const onAbort = (): void => { clearTimeout(timer); reject(abortError()); };
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
-  });
+  // Larger Node.js timer delays overflow to 1ms. Split long server-directed
+  // waits into supported chunks while keeping each chunk cancellable.
+  while (ms > 0) {
+    if (signal?.aborted) throw abortError();
+    const delay = Math.min(ms, 2_147_483_647);
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        reject(abortError());
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, delay);
+      timer.unref?.();
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+    ms -= delay;
+  }
 }
 
 async function withDeadline<T>(
@@ -234,9 +254,17 @@ const streamChunkSchema = z
 
 const modelListSchema = z
   .object({
-    data: z.array(z.object({ id: nanoGptModelIdSchema }).passthrough()).min(1),
+    data: z.array(z.object({
+      id: nanoGptModelIdSchema,
+      reasoning_efforts: z.unknown().optional(),
+    }).passthrough()).min(1),
   })
   .passthrough();
+
+export interface NanoGptModelCatalogEntry {
+  id: string;
+  reasoningEfforts: unknown;
+}
 
 const errorBodySchema = z
   .object({
@@ -284,10 +312,12 @@ async function readErrorBody(response: Response): Promise<string> {
 
 export interface NanoGptClient {
   listModels(signal?: AbortSignal): Promise<string[]>;
+  listModelCatalog(signal?: AbortSignal): Promise<NanoGptModelCatalogEntry[]>;
   streamChatCompletion(args: {
     model: string;
     messages: readonly NanoGptMessage[];
     tools?: readonly NanoGptToolDefinition[];
+    reasoningEffort?: NanoGptReasoningEffort;
     signal?: AbortSignal;
   }): AsyncGenerator<NanoGptStreamEvent>;
 }
@@ -323,30 +353,45 @@ export function createNanoGptClient(args: {
     });
   }
 
+  async function fetchModels(url: string, signal?: AbortSignal): Promise<NanoGptModelCatalogEntry[]> {
+    return withDeadline(async (requestSignal) => {
+      const response = await raceAbort(
+        fetchImpl(url, { method: "GET", headers: authHeaders(), signal: requestSignal }),
+        requestSignal,
+        discardLateResponse,
+      );
+      if (!response.ok) await fail(response, requestSignal);
+      const parsed = modelListSchema.safeParse(await raceAbort(response.json(), requestSignal));
+      if (!parsed.success) {
+        throw new NanoGptApiError({
+          status: response.status,
+          message: "NanoGPT model list response had an unexpected shape",
+        });
+      }
+      return parsed.data.data.map((model) => ({
+        id: model.id,
+        reasoningEfforts: model.reasoning_efforts,
+      }));
+    }, signal, MODEL_LIST_TIMEOUT_MS, "The NanoGPT model list timed out. Please try again.");
+  }
+
   return {
     async listModels(signal) {
-      return withDeadline(async (requestSignal) => {
-        const response = await raceAbort(
-          fetchImpl(`${baseUrl}/models`, {
-            method: "GET",
-            headers: authHeaders(),
-            signal: requestSignal,
-          }),
-          requestSignal,
-          discardLateResponse,
-        );
-        if (!response.ok) await fail(response, requestSignal);
-        const parsed = modelListSchema.safeParse(
-          await raceAbort(response.json(), requestSignal),
-        );
-        if (!parsed.success) {
-          throw new NanoGptApiError({
-            status: response.status,
-            message: "NanoGPT model list response had an unexpected shape",
-          });
+      return (await fetchModels(`${baseUrl}/models`, signal)).map((model) => model.id);
+    },
+
+    async listModelCatalog(signal) {
+      try {
+        return await fetchModels(`${baseUrl}/models?detailed=true`, signal);
+      } catch (error) {
+        if (!(error instanceof NanoGptApiError) || ![400, 404, 405, 422].includes(error.status)) {
+          throw error;
         }
-        return parsed.data.data.map((model) => model.id);
-      }, signal, MODEL_LIST_TIMEOUT_MS, "The NanoGPT model list timed out. Please try again.");
+        return (await fetchModels(`${baseUrl}/models`, signal)).map((model) => ({
+          id: model.id,
+          reasoningEfforts: undefined,
+        }));
+      }
     },
 
     async *streamChatCompletion(streamArgs) {
@@ -358,6 +403,9 @@ export function createNanoGptClient(args: {
       };
       if (streamArgs.tools !== undefined && streamArgs.tools.length > 0) {
         body.tools = streamArgs.tools;
+      }
+      if (streamArgs.reasoningEffort !== undefined) {
+        body.reasoning_effort = streamArgs.reasoningEffort;
       }
       if (streamArgs.signal?.aborted === true) {
         throw abortError();
@@ -388,6 +436,7 @@ export function createNanoGptClient(args: {
           if (err instanceof DOMException && err.name === "AbortError") throw err;
           if (err instanceof NanoGptTimeoutError) throw err;
           if (attempt >= RETRY_CONFIG.maxRetries) throw err;
+          lastResponse = null;
           debug?.(`NanoGPT request failed: ${err instanceof Error ? err.message : err}, retrying...`);
           continue;
         }
@@ -641,6 +690,12 @@ export function createNanoGptClient(args: {
         if (err instanceof NanoGptTimeoutError || (err instanceof DOMException && err.name === "AbortError")) throw err;
         // Other errors from fail() are NanoGptApiError with status - retry if retryable
         if (!isRetryableStatus(response.status)) throw err;
+        if (attempt >= RETRY_CONFIG.maxRetries) {
+          throw new NanoGptApiError({
+            status: response.status,
+            message: `${err instanceof Error ? err.message : String(err)} (after ${attempt + 1} attempts)`,
+          });
+        }
         debug?.(`NanoGPT request failed with ${response.status}, will retry...`);
         continue;
       }

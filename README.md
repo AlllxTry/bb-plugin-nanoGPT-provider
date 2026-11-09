@@ -241,12 +241,40 @@ waits for a tool result or the consumer pauses between reads. A timeout fails th
 turn; a user Stop interrupts it. Connections and local file operations are
 cancelled on a best-effort basis, while late results cannot change a settled turn.
 
-Reasoning uses the **Provider default** option. The plugin does not expose
-low/medium/high choices that silently do nothing, nor send an unverified
-`reasoning_effort` parameter to every routed backend. Reasoning deltas are still
-streamed and their timeline item is closed with its accumulated text. In SDK
-metadata, `medium` is the required fallback identifier for the single default
-option; it does not request medium effort from the upstream.
+Reasoning defaults to **Provider default**. The live model catalog exposes
+explicit Low, Medium, or High choices only when NanoGPT declares those values
+for that model. Explicit choices are sent as `reasoning_effort` and rejected
+locally if the model does not advertise them. Provider default omits the
+parameter, including for older saved turns whose `medium` value meant the
+provider default. Models without verified effort metadata remain available at
+the upstream default. Reasoning deltas are streamed separately when returned.
+
+### Automatic request retries
+
+Each completion request allows at most four attempts: the initial request and
+three retries. Before a successful HTTP response starts streaming, HTTP 429,
+502, 503, and 504 responses and transport failures can trigger a retry. Other
+HTTP errors, user cancellation, and request or response-body timeouts fail
+immediately. Once a successful response starts streaming, a broken or incomplete
+stream fails the turn instead of replaying the request. Model-list requests do
+not use this completion retry policy.
+
+For every retryable HTTP status, `Retry-After` takes precedence over the local
+backoff. Both non-negative integer seconds (`Retry-After: 60`) and HTTP dates
+(`Retry-After: Mon, 09 Nov 2026 00:01:00 GMT`) are supported. A future date waits
+until that time; zero seconds or an elapsed date adds no delay. Malformed values
+fall back to the local backoff. Without a usable header, retry waits are about
+2, 4, and 8 seconds, each with up to 500 ms of jitter; local backoff is capped at
+10 seconds. A transport failure uses local backoff rather than reusing a header
+from an earlier response.
+
+Server-directed waits can exceed the local 10-second cap. Long waits are split
+into intervals supported by the runtime, and Stop can cancel the wait without
+sending another request. The 120-second request/read deadlines apply to network
+operations, not to the retry wait; there is no overall retry deadline. After
+four retryable HTTP failures, the reported error retains the final upstream
+status and message and includes the attempt count. For example:
+`NanoGPT API error 429: Daily quota exhausted (after 4 attempts)`.
 
 ## Context and attachment limits
 
@@ -472,10 +500,16 @@ stdout remains reserved for JSON-RPC.
 
 ## Limitations
 
-- Conversation history lives in the bridge process only. The bridge does not
-  advertise session restore, so a thread resumed after a restart starts with an
-  empty model context. Interrupting a turn preserves the session and its history;
-  releasing a thread or replacing its session discards that context.
+- bb remains the persistent source of conversation history. On the first turn
+  after `thread/resume`, the provider reads saved bb events before sending the
+  new prompt to NanoGPT. It restores accepted user prompts, assistant text and
+  normalized tool interactions; historical tools are never re-executed. URL
+  images are restored, while unavailable historical local attachments become
+  filename placeholders. Original NanoGPT request grouping and tool-call IDs
+  are not stored in bb's event history. The event scan is bounded to 400 pages
+  of 25 events. A live provider/daemon restart has not yet been verified.
+  Interrupting a turn preserves the active in-memory session; releasing it
+  discards provider memory while bb retains the conversation.
 - Input rejected before any usable model output or tool calls is excluded from
   subsequent requests, with an error explaining that it was not retained. Partial
   answers and executed tool results are preserved after later failures. Errors
@@ -513,8 +547,8 @@ stdout remains reserved for JSON-RPC.
   the model is told so. Binary files and files that cannot be read are described
   to the model as unavailable, never guessed at. Local images are sent as data
   URLs within the documented image limits; model vision support is required.
-- Reasoning effort is controlled by the upstream model; only Provider default
-  is offered. There are no per-model effort overrides yet.
+- The reasoning picker only offers effort levels declared for the selected
+  model. Models without verified effort metadata use Provider default.
 - Only the `full` permission mode is offered. There is no fork, archive, rename,
   manual compaction or service tier support.
 - The complete model list is returned, with preferred models first.

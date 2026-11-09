@@ -13,6 +13,8 @@ import type {
   ThreadEvent,
 } from "@get-bb/plugin-sdk/provider-bridge/testing";
 import { handleLine } from "./provider-bridge.js";
+import { decodeContextCheckpoint, HISTORY_TOOL_NAME } from "./history-protocol.js";
+import { restoreNanoGptHistory } from "./history-adapter.js";
 import { NANO_GPT_API_KEY_ENV, NANO_GPT_PROVIDER_ID } from "./vocabulary.js";
 import { STREAM_IDLE_TIMEOUT_MS } from "./nano-gpt-client.js";
 
@@ -118,6 +120,21 @@ function deltaNotifications() {
   return harness.messages
     .filter((message) => message.method === "thread/delta")
     .flatMap((message) => (message.params as { deltas: never[] }).deltas);
+}
+
+function restoreCollectedHistory(inputs: { requestId: string; text: string }[]) {
+  const collector = createBridgeDeltaEventCollector(NANO_GPT_PROVIDER_ID);
+  const events = harness.messages.flatMap((message) => collector.assembleMessage(message));
+  return restoreNanoGptHistory([
+    ...inputs.map((input, index) => ({
+      seq: index + 1, type: "client/turn/requested", scope: { kind: "thread" },
+      data: { requestId: input.requestId, initiator: "user", input: [{ type: "text", text: input.text }] },
+    })),
+    ...events.map((event, index) => ({
+      seq: inputs.length + index + 1, type: event.type,
+      scope: (event as { scope?: unknown }).scope, data: event,
+    })),
+  ]);
 }
 
 interface BoundaryDelta {
@@ -367,7 +384,70 @@ describe("the NanoGPT bridge", () => {
     const models = (result.result as { models: { id: string; isDefault: boolean; supportedReasoningEfforts: unknown[] }[] }).models;
     expect(models.map((model) => model.id)).toEqual(expected);
     expect(models.filter((model) => model.isDefault).map((model) => model.id)).toEqual([expected[0]]);
-    expect(models[0].supportedReasoningEfforts).toEqual([expect.objectContaining({ reasoningEffort: "medium", label: "Provider default" })]);
+    expect(models[0].supportedReasoningEfforts).toEqual([expect.objectContaining({ reasoningEffort: "nanogpt:provider-default", label: "Provider default" })]);
+  });
+
+  it("advertises each model's declared reasoning levels and sends an explicit choice", async () => {
+    const envVars = { [NANO_GPT_API_KEY_ENV]: "sk-reasoning-test" };
+    responses.push(
+      new Response(JSON.stringify({ data: [
+        { id: "openai/gpt-6.1-sol", reasoning_efforts: ["low", "medium", "high"] },
+        { id: "legacy/model" },
+      ] })),
+    );
+    const listed = await request("model/list", { envVars });
+    const models = (listed.result as { models: { id: string; reasoningDiscovery: string; supportedReasoningEfforts: { reasoningEffort: string }[] }[] }).models;
+    expect(models.find((model) => model.id === "openai/gpt-6.1-sol")).toMatchObject({
+      reasoningDiscovery: "known",
+      supportedReasoningEfforts: [
+        { reasoningEffort: "nanogpt:provider-default" },
+        { reasoningEffort: "nanogpt:effort:low" },
+        { reasoningEffort: "nanogpt:effort:medium" },
+        { reasoningEffort: "nanogpt:effort:high" },
+      ],
+    });
+    expect(models.find((model) => model.id === "legacy/model")).toMatchObject({
+      reasoningDiscovery: "unknown",
+      supportedReasoningEfforts: [{ reasoningEffort: "nanogpt:provider-default" }],
+    });
+    responses.push(new Response(JSON.stringify({ data: [{ id: "empty/model", reasoning_efforts: [] }] })));
+    const emptyList = await request("model/list", { envVars: { [NANO_GPT_API_KEY_ENV]: "sk-reasoning-empty" } });
+    expect((emptyList.result as { models: { reasoningDiscovery: string }[] }).models[0]?.reasoningDiscovery)
+      .toBe("known");
+
+    responses.push(answerResponse("deeply considered"));
+    const providerThreadId = await startThread();
+    await request("turn/start", {
+      threadId: THREAD_ID,
+      providerThreadId,
+      input: [{ type: "text", text: "review", mentions: [] }],
+      clientRequestId: "creq_abcdefgh23",
+      options: {
+        ...FULL_OPTIONS,
+        envVars,
+        reasoningLevel: "nanogpt:effort:high",
+      },
+    });
+    await waitFor(() => boundary("completed"));
+    expect(fetchCalls).toHaveLength(3);
+    expect(fetchCalls[0].url).toContain("/models?detailed=true");
+    expect(fetchCalls[2].body.reasoning_effort).toBe("high");
+  });
+
+  it("rejects an explicit effort the selected model does not advertise", async () => {
+    const envVars = { [NANO_GPT_API_KEY_ENV]: "sk-reasoning-unsupported" };
+    responses.push(new Response(JSON.stringify({ data: [{ id: "openai/gpt-6.1-sol", reasoning_efforts: ["low"] }] })));
+    const providerThreadId = await startThread();
+    await request("turn/start", {
+      threadId: THREAD_ID,
+      providerThreadId,
+      input: [{ type: "text", text: "review", mentions: [] }],
+      clientRequestId: "creq_abcdefgh24",
+      options: { ...FULL_OPTIONS, envVars, reasoningLevel: "nanogpt:effort:high" },
+    });
+    await waitFor(() => boundary("failed"));
+    expect(fetchCalls).toHaveLength(1);
+    expect(JSON.stringify(deltaNotifications())).toContain("does not declare high");
   });
 
   it("enforces plan mode and clears its system instruction on the next ordinary turn", async () => {
@@ -511,6 +591,15 @@ describe("the NanoGPT bridge", () => {
       { role: "user", content: "revised input" },
     ]);
     await waitFor(() => (deltaNotifications() as BoundaryDelta[]).filter((d) => d.status === "completed").length === 2);
+    const restored = restoreCollectedHistory([
+      { requestId: "creq_abcdefgh72", text: "earlier input" },
+      { requestId: "creq_abcdefgh82", text: "poisoned input" },
+      { requestId: "creq_abcdefgh92", text: "revised input" },
+    ]);
+    expect(restored.messages.map((message) => message.content)).toEqual(["earlier input", "earlier answer", "revised input", "recovered"]);
+    const failedBoundary = (deltaNotifications() as { kind: string; status?: string; providerCheckpointId?: string }[])
+      .find((delta) => delta.kind === "turn.boundary" && delta.status === "failed");
+    expect(decodeContextCheckpoint(failedBoundary?.providerCheckpointId)).toEqual({ requestId: "creq_abcdefgh82", inputRetained: false });
   });
 
   it("preserves executed tools when a later API round fails", async () => {
@@ -553,12 +642,26 @@ describe("the NanoGPT bridge", () => {
     await startTurn("queued old", "creq_abcdefghf2", oldId);
     const replacement = await request(method, {
       threadId: THREAD_ID, providerThreadId: "replacement", cwd: CWD,
-      instructionMode: "append", dynamicTools: [TOOL_DEFINITION], options: FULL_OPTIONS,
+      instructionMode: "append",
+      dynamicTools: method === "thread/resume"
+        ? [{ name: HISTORY_TOOL_NAME, description: "Read saved events.", inputSchema: { type: "object", properties: {} } }, TOOL_DEFINITION]
+        : [TOOL_DEFINITION],
+      options: FULL_OPTIONS,
     });
     const newId = (replacement.result as { providerThreadId: string }).providerThreadId;
     const countAtReplacement = deltaMessages().length;
     answerToolCall(0);
     await startTurn("fresh", "creq_abcdefghg2", newId);
+    if (method === "thread/resume") {
+      await waitFor(() => toolCallRequests().length === 2);
+      const historyCall = toolCallRequests()[1]!;
+      handleLine(JSON.stringify({
+        jsonrpc: "2.0", id: historyCall.id,
+        result: { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({
+          version: 1, threadId: THREAD_ID, throughSeq: 0, nextAfterSeq: null, events: [],
+        }) }] },
+      }));
+    }
     await waitFor(() => boundary("completed"));
     expect(fetchCalls).toHaveLength(2);
     expect(fetchCalls[1].body.messages).toEqual([
@@ -578,7 +681,7 @@ describe("the NanoGPT bridge", () => {
       protocolVersion: 2,
       capabilities: {
         grammarVersions: [3],
-        sessionRestore: false,
+        sessionRestore: true,
         steerMode: "queue",
       },
     });
@@ -586,6 +689,10 @@ describe("the NanoGPT bridge", () => {
 
   it("runs a turn with one tool round and streams the final answer", async () => {
     await initialize();
+    const effortEnvVars = { [NANO_GPT_API_KEY_ENV]: "sk-tool-reasoning-test" };
+    responses.push(new Response(JSON.stringify({ data: [
+      { id: "openai/gpt-6.1-sol", reasoning_efforts: ["low", "medium", "high"] },
+    ] })));
     responses.push(
       sseResponse([
         chunk({
@@ -629,7 +736,7 @@ describe("the NanoGPT bridge", () => {
       providerThreadId,
       input: [{ type: "text", text: "read it", mentions: [] }],
       clientRequestId: "creq_abcdefgh23",
-      options: FULL_OPTIONS,
+      options: { ...FULL_OPTIONS, envVars: effortEnvVars, reasoningLevel: "nanogpt:effort:high" },
     });
 
     await waitFor(() =>
@@ -657,11 +764,14 @@ describe("the NanoGPT bridge", () => {
 
     await waitFor(() => boundary("completed"));
 
-    expect(fetchCalls).toHaveLength(2);
-    expect(fetchCalls[0].url).toBe(
+    expect(fetchCalls).toHaveLength(3);
+    expect(fetchCalls[0].url).toContain("/models?detailed=true");
+    expect(fetchCalls[1].url).toBe(
       "https://api.nano-gpt.com/api/v1/chat/completions",
     );
-    expect(fetchCalls[0].body.tools).toEqual([
+    expect(fetchCalls[1].body.reasoning_effort).toBe("high");
+    expect(fetchCalls[2].body.reasoning_effort).toBe("high");
+    expect(fetchCalls[1].body.tools).toEqual([
       {
         type: "function",
         function: {
@@ -671,11 +781,11 @@ describe("the NanoGPT bridge", () => {
         },
       },
     ]);
-    expect(fetchCalls[0].body.messages).toMatchObject([
+    expect(fetchCalls[1].body.messages).toMatchObject([
       { role: "system", content: expect.stringContaining(CWD) },
       { role: "user", content: "read it" },
     ]);
-    const secondRoundMessages = fetchCalls[1].body.messages as {
+    const secondRoundMessages = fetchCalls[2].body.messages as {
       role: string;
       tool_call_id?: string;
       content?: string;
@@ -699,7 +809,7 @@ describe("the NanoGPT bridge", () => {
     });
     expect(deltas.some((delta) => delta.kind === "turn.open")).toBe(true);
     expect(deltas.some((delta) => delta.kind === "usage")).toBe(true);
-    expect(deltas.at(-1)).toEqual({
+    expect(deltas.at(-1)).toMatchObject({
       kind: "turn.boundary",
       status: "completed",
     });
@@ -799,7 +909,7 @@ describe("the NanoGPT bridge", () => {
     });
   });
 
-  it("does not claim session restore on start or resume", async () => {
+  it("claims session restore for new and resumed provider sessions", async () => {
     await initialize();
     const started = await request("thread/start", {
       threadId: THREAD_ID,
@@ -808,7 +918,7 @@ describe("the NanoGPT bridge", () => {
       dynamicTools: [],
       options: FULL_OPTIONS,
     });
-    expect(started.result).toMatchObject({ sessionRestorable: false });
+    expect(started.result).toMatchObject({ sessionRestorable: true });
     const resumed = await request("thread/resume", {
       threadId: THREAD_ID,
       providerThreadId: "nano_gpt_old_1",
@@ -817,7 +927,76 @@ describe("the NanoGPT bridge", () => {
       dynamicTools: [],
       options: FULL_OPTIONS,
     });
-    expect(resumed.result).toMatchObject({ sessionRestorable: false });
+    expect(resumed.result).toMatchObject({ sessionRestorable: true });
+  });
+
+  it("restores saved context before the first request after resume without exposing its tool", async () => {
+    responses.push(answerResponse("continued"));
+    await initialize();
+    const resumed = await request("thread/resume", {
+      threadId: THREAD_ID,
+      providerThreadId: "nano_gpt_previous",
+      cwd: CWD,
+      instructionMode: "append",
+      dynamicTools: [{
+        name: HISTORY_TOOL_NAME,
+        description: "Read saved thread events.",
+        inputSchema: { type: "object", properties: {} },
+      }, TOOL_DEFINITION],
+      options: FULL_OPTIONS,
+    });
+    expect(resumed.result).toMatchObject({ sessionRestorable: true });
+
+    await startTurn("new question", "creq_abcdefgh22", "nano_gpt_previous");
+    await waitFor(() => toolCallRequests().length === 1);
+    const historyCall = toolCallRequests()[0]!;
+    expect((historyCall.params as { tool: string }).tool).toBe(HISTORY_TOOL_NAME);
+    expect((historyCall.params as { arguments: unknown }).arguments).toMatchObject({
+      afterSeq: null, throughSeq: null, currentRequestId: "creq_abcdefgh22",
+    });
+    handleLine(JSON.stringify({
+      jsonrpc: "2.0", id: historyCall.id,
+      result: {
+        success: true,
+        contentItems: [{ type: "inputText", text: JSON.stringify({
+          version: 1,
+          threadId: THREAD_ID,
+          throughSeq: 4,
+          nextAfterSeq: null,
+          events: [
+            { seq: 1, type: "client/turn/requested", scope: {}, data: { requestId: "old-request", initiator: "user", input: [{ type: "text", text: "earlier question" }] } },
+            { seq: 2, type: "turn/input/accepted", scope: { kind: "turn", turnId: "old-turn" }, data: { clientRequestId: "old-request" } },
+            { seq: 3, type: "item/completed", scope: { kind: "turn", turnId: "old-turn" }, data: { item: { id: "old-answer", type: "agentMessage", text: "earlier answer" } } },
+            { seq: 4, type: "turn/completed", scope: { kind: "turn", turnId: "old-turn" }, data: { status: "completed" } },
+          ],
+        }) }],
+      },
+    }));
+
+    await waitFor(() => fetchCalls.length === 1);
+    expect(fetchCalls[0]!.body.messages).toEqual([
+      expect.objectContaining({ role: "system" }),
+      { role: "user", content: "earlier question" },
+      { role: "assistant", content: "earlier answer" },
+      { role: "user", content: "new question" },
+    ]);
+    expect(fetchCalls[0]!.body.tools).toEqual([expect.objectContaining({ function: expect.objectContaining({ name: "read_file" }) })]);
+    await waitFor(() => boundary("completed"));
+  });
+
+  it("fails a resumed turn without calling NanoGPT when history retrieval fails", async () => {
+    await request("thread/resume", {
+      threadId: THREAD_ID, providerThreadId: "nano_gpt_previous", cwd: CWD,
+      instructionMode: "append", dynamicTools: [{
+        name: HISTORY_TOOL_NAME, description: "Read saved events.", inputSchema: { type: "object", properties: {} },
+      }], options: FULL_OPTIONS,
+    });
+    await startTurn("new question", "creq_abcdefgh22", "nano_gpt_previous");
+    await waitFor(() => toolCallRequests().length === 1);
+    const call = toolCallRequests()[0]!;
+    handleLine(JSON.stringify({ jsonrpc: "2.0", id: call.id, result: { success: false, contentItems: [{ type: "inputText", text: "history unavailable" }] } }));
+    await waitFor(() => boundary("failed"));
+    expect(fetchCalls).toHaveLength(0);
   });
 
   it("sums token usage over every model round of a turn", async () => {
@@ -980,6 +1159,19 @@ describe("the NanoGPT bridge", () => {
     expect(accepted.map((delta) => delta.clientRequestId)).toEqual([
       "creq_abcdefgh78",
       "creq_abcdefgh72",
+    ]);
+    const restored = restoreCollectedHistory([
+      { requestId: "creq_abcdefgh78", text: "one" },
+      { requestId: "creq_abcdefgh72", text: "two" },
+    ]);
+    expect(restored.messages.map((message) => message.content)).toEqual(["one", null, "x", "first", "two", "steered"]);
+    expect(restored.completedTurnEnds).toEqual([4, 6]);
+    const checkpoints = (deltaNotifications() as { kind: string; providerCheckpointId?: string }[])
+      .filter((delta) => delta.kind === "turn.boundary")
+      .map((delta) => decodeContextCheckpoint(delta.providerCheckpointId));
+    expect(checkpoints).toEqual([
+      { requestId: "creq_abcdefgh78", inputRetained: true },
+      { requestId: "creq_abcdefgh72", inputRetained: true },
     ]);
   });
 
@@ -1153,6 +1345,12 @@ describe("the NanoGPT bridge", () => {
     );
     expect(boundaries).toHaveLength(1);
     expect(boundaries[0].status).toBe("interrupted");
+    const restored = restoreCollectedHistory([
+      { requestId: "creq_abcdefgh7d", text: "one" },
+      { requestId: "creq_abcdefgh7e", text: "two" },
+    ]);
+    expect(restored.messages.filter((message) => message.role === "user")).toEqual([{ role: "user", content: "one" }]);
+    expect(restored.completedTurnEnds).toEqual([restored.messages.length]);
   });
 
   it("drops a response that arrives after the turn was stopped", async () => {
