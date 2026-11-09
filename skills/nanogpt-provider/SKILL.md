@@ -129,17 +129,29 @@ deadline. See `docs/REASONING_EFFORT.md` for the complete behavior and open chec
   most 400 pages of 25 events; real daemon-restart verification remains open.
 - One turn runs per thread at a time. Stopping a turn ends it with one
   interrupted event and drops queued follow-up messages, while retaining its
-  in-memory conversation context. Release/replacement discards that session.
-- The local fallback context budget is 32768 estimated tokens, including a 4096
-  output reserve in its calculation. It is not a verified window for every model.
-  Current turns and assistant/tool pairs remain intact; older turns are excluded
-  with a notice. Stored assistant/tool text is bounded to 24000 UTF-8 bytes.
+  in-memory conversation context. A dropped follow-up that was already
+  accepted is reported with a visible warning rather than vanishing silently.
+  Release/replacement discards that session.
+- The context budget comes from the model's advertised context window when the
+  catalog provides a sane one (minus a 4096-token output reserve); otherwise a
+  local fallback of 32768 estimated tokens applies, with 28672 for input. It is
+  not a verified window for every model. Current turns and assistant/tool pairs
+  remain intact; older turns are excluded with a notice, and oversized tool
+  replies produced inside the current turn are shortened in place to 2000
+  characters before the turn is rejected. Stored assistant/tool text is bounded
+  to 24000 UTF-8 bytes.
+- A transport failure while a request is in flight is never replayed (a POST
+  could bill twice); only provably pre-send failures (DNS, refused, unreachable)
+  are retried. Server `Retry-After` waits above 120 seconds fail the request
+  instead of parking the turn.
 - Failed input before useful output/tools is not kept in future API history.
   Partial answers and already executed tool results survive later failures.
 - For unmatched/late tool-reply diagnostics, NANOGPT_DEBUG_BRIDGE=1 in the bridge
   environment enables generic stderr messages without payloads or keys. Late
   replies after Stop/replacement are expected and still cannot revive a turn.
 
-Reasoning overrides and history restoration are part of release 0.1.6. Do not
-claim them for an older tagged installation without checking its version/source.
-Synthetic tests do not establish live composer/API compatibility.
+Reasoning overrides and history restoration are part of release 0.1.6; the
+retry, context-budget, restoration-retry and reasoning-stream fixes described
+above are unreleased source-tree changes. Do not claim either for an older
+tagged installation without checking its version/source. Synthetic tests do not
+establish live composer/API compatibility.

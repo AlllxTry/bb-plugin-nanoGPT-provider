@@ -1352,12 +1352,18 @@ describe("the NanoGPT bridge", () => {
     answerToolCall(0);
     await new Promise((resolve) => setTimeout(resolve, 50));
     // The queued input is dropped: no second model request, one boundary.
+    // The dropped follow-up was already accepted, so it is reported with a
+    // non-terminal provider warning instead of vanishing silently.
     expect(fetchCalls).toHaveLength(1);
     const boundaries = (deltaNotifications() as BoundaryDelta[]).filter(
       (delta) => delta.kind === "turn.boundary",
     );
     expect(boundaries).toHaveLength(1);
     expect(boundaries[0].status).toBe("interrupted");
+    const warnings = (deltaNotifications() as unknown as { kind: string; summary?: string }[])
+      .filter((delta) => delta.kind === "provider.warning");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].summary).toContain("cancelled by Stop");
     const restored = restoreCollectedHistory([
       { requestId: "creq_abcdefgh7d", text: "one" },
       { requestId: "creq_abcdefgh7e", text: "two" },
@@ -1489,5 +1495,77 @@ describe("the NanoGPT bridge", () => {
       options: FULL_OPTIONS,
     });
     expect(response.error?.code).toBe(BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN);
+  });
+
+  it("opens a reasoning item before its first reasoning delta", async () => {
+    await initialize();
+    responses.push(
+      sseResponse([
+        chunk({ choices: [{ delta: { reasoning_content: "thinking" } }] }),
+        chunk({ choices: [{ delta: { content: "answer" } }] }),
+        chunk({ choices: [{ delta: {}, finish_reason: "stop" }] }),
+        "data: [DONE]\n\n",
+      ]),
+    );
+    const providerThreadId = await startThread();
+    await startTurn("go", "creq_abcdefghuv", providerThreadId);
+    await waitFor(() => boundary("completed"));
+    const deltas = deltaNotifications() as unknown as {
+      kind: string;
+      key?: { providerItemId: string };
+      channel?: string;
+      item?: { type: string };
+    }[];
+    const opens = deltas.filter((delta) => delta.kind === "item.open");
+    const reasoningOpen = opens.find((delta) => delta.item?.type === "reasoning");
+    expect(reasoningOpen).toBeDefined();
+    const openedKeys = new Set(opens.map((delta) => delta.key?.providerItemId));
+    const reasoningDelta = deltas.find(
+      (delta) => delta.kind === "item.textDelta" && delta.channel === "reasoningText",
+    );
+    expect(reasoningDelta).toBeDefined();
+    // Every reasoning textDelta key must have been opened first.
+    expect(openedKeys.has(reasoningDelta!.key!.providerItemId)).toBe(true);
+  });
+
+  it("clears the restoration requirement after one failed history read instead of failing forever", async () => {
+    await request("thread/resume", {
+      threadId: THREAD_ID, providerThreadId: "nano_gpt_restore_fail", cwd: CWD,
+      instructionMode: "append", dynamicTools: [{
+        name: HISTORY_TOOL_NAME, description: "Read saved events.", inputSchema: { type: "object", properties: {} },
+      }], options: FULL_OPTIONS,
+    });
+    responses.push(answerResponse("after failed restore"));
+    await startTurn("first", "creq_abcdefghuw", "nano_gpt_restore_fail");
+    await waitFor(() => toolCallRequests().length === 1);
+    handleLine(JSON.stringify({ jsonrpc: "2.0", id: toolCallRequests()[0]!.id, result: { success: false, contentItems: [{ type: "inputText", text: "history unavailable" }] } }));
+    await waitFor(() => boundary("failed"));
+    // The second turn proceeds: the sticky restoration requirement is gone.
+    await startTurn("second", "creq_abcdefghux", "nano_gpt_restore_fail");
+    await waitFor(() => fetchCalls.length === 1);
+    expect(fetchCalls[0].body.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "user", content: "second" }),
+    ]));
+    await waitFor(() => boundary("completed"));
+  });
+
+  it("resolves the model/list endpoint from provider options before env", async () => {
+    await initialize();
+    responses.push(new Response(JSON.stringify({ data: [{ id: "model/x" }] })));
+    const result = await request("model/list", {
+      envVars: { [NANO_GPT_API_KEY_ENV]: "sk-nano-bridge-test", NANOGPT_BASE_URL: "https://env.example.invalid/v1" },
+      providerOptions: { baseUrl: "https://options.example.invalid/v1" },
+    });
+    expect(result.error).toBeUndefined();
+    expect(fetchCalls[0].url).toContain("https://options.example.invalid/v1");
+  });
+
+  it("reports a model/list failure as an error instead of an empty list", async () => {
+    await initialize();
+    const fetch = vi.fn(async () => new Response("nope", { status: 500 }));
+    vi.stubGlobal("fetch", fetch);
+    const response = await request("model/list", { envVars: FULL_OPTIONS.envVars });
+    expect(response.error).toBeDefined();
+    expect(response.error?.code).toBe(BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR);
   });
 });

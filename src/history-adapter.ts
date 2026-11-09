@@ -65,7 +65,11 @@ function userMessage(input: unknown): NanoGptMessage["content"] | null {
   if (parts.every((part) => typeof part === "string" || part.type === "text")) {
     return parts.map((part) => typeof part === "string"
       ? part
-      : part.type === "text" ? part.text : "").join("");
+      : part.type === "text" ? part.text : "")
+      // Blank-line separators keep adjacent restored text parts (a message
+      // plus a placeholder for a missing local file) from fusing together.
+      .filter((text) => text.trim() !== "" || parts.length === 1)
+      .join("\n\n");
   }
   return parts.map((part) => typeof part === "string"
     ? { type: "text" as const, text: part }

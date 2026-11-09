@@ -34,7 +34,7 @@ import { describeAttachedFile, readAttachedImage, MAX_IMAGE_BYTES, MAX_TOTAL_IMA
 import { normalizeBaseUrl } from "./base-url.js";
 import { toolControlsSchema, unsupportedPermissionPolicy, type ToolControls } from "./permissions.js";
 import { toolApprovalAllowed, toolApprovalPresentation } from "./tool-approval.js";
-import { boundedHistoryText, estimateTextTokens, fitContext } from "./context.js";
+import { boundedHistoryText, estimateTextTokens, fitContext, inputTokenBudgetFor, INPUT_TOKEN_BUDGET } from "./context.js";
 import { restoreNanoGptHistory } from "./history-adapter.js";
 import {
   HISTORY_TOOL_NAME,
@@ -162,8 +162,10 @@ async function modelCatalog(
   for (const record of records) {
     const previous = result.get(record.id);
     if (previous === undefined) result.set(record.id, record);
-    else if (JSON.stringify(previous.reasoningEfforts) !== JSON.stringify(record.reasoningEfforts)) {
-      result.set(record.id, { id: record.id, reasoningEfforts: undefined });
+    else if (JSON.stringify(previous.reasoningEfforts) !== JSON.stringify(record.reasoningEfforts) ||
+      previous.contextLength !== record.contextLength) {
+      // Conflicting duplicate records make any specific claim untrustworthy.
+      result.set(record.id, { id: record.id, reasoningEfforts: undefined, contextLength: null });
     }
   }
   modelCatalogCache.set(cacheKey, { expiresAt: Date.now() + MODEL_CATALOG_TTL_MS, entries: result });
@@ -327,7 +329,10 @@ async function userContent(input: readonly PromptInput[], signal: AbortSignal): 
   if (parts.every((part) => part.type === "text")) {
     return parts
       .map((part) => (part as Extract<NanoGptContentPart, { type: "text" }>).text)
-      .join("");
+      // Blank-line separators keep adjacent text parts (a message plus a file,
+      // or two files) from fusing into each other.
+      .filter((text) => text.trim() !== "" || parts.length === 1)
+      .join("\n\n");
   }
   return parts;
 }
@@ -822,6 +827,9 @@ async function runTurnWork(
   let turnUsage: ThreadEventTokenUsageBreakdown = ZERO_TOKEN_USAGE;
   let requestBaseUrl = "";
   let reasoningEffort: NanoGptReasoningEffort | undefined;
+  // Resolved from the model's advertised context window; the local 32K fallback
+  // until the catalog says otherwise.
+  let contextTokenBudget = INPUT_TOKEN_BUDGET;
 
   try {
     const model = modelId(args.options);
@@ -846,12 +854,24 @@ async function runTurnWork(
         }
       }
       reasoningEffort = reasoningSelection.effort;
+      contextTokenBudget = inputTokenBudgetFor(catalog.get(model)?.contextLength);
     }
     const planMode = providerOptions.promptMode === "plan";
     setSystemMessage(session, args.options, planMode);
     if (session.restorationRequired) {
-      await restoreSessionHistory(session, args.clientRequestId, signal, toolControlsSchema.parse(args.options.providerOptions ?? {}));
-      if (turn.settled || signal.aborted) throw abortError();
+      // A failed restoration must not repeat on every turn of a resumed
+      // thread: it would fail forever. It fails this turn (which reports
+      // it), and one failed attempt clears the requirement so later turns
+      // continue with the current input only.
+      try {
+        await restoreSessionHistory(session, args.clientRequestId, signal, toolControlsSchema.parse(args.options.providerOptions ?? {}));
+        if (turn.settled || signal.aborted) throw abortError();
+      } catch (error) {
+        if (turn.settled) return;
+        session.restorationRequired = false;
+        if (signal.aborted || (error instanceof Error && error.name === "AbortError")) throw abortError();
+        throw error;
+      }
     }
     historyMark = session.messages.length;
     turn.historyStart = historyMark;
@@ -869,7 +889,15 @@ async function runTurnWork(
           message: `Stopped after ${MAX_TOOL_ROUNDS} tool rounds without a final answer.`,
         });
       }
-      const context = fitContext(session.messages, session.completedTurnEnds, historyMark, tools);
+      const context = fitContext(
+        session.messages,
+        session.completedTurnEnds,
+        historyMark,
+        tools,
+        // A model with an advertised context window uses it; others fall back
+        // to the local 32K policy.
+        contextTokenBudget,
+      );
       historyMark = context.currentStart;
       turn.historyStart = historyMark;
       if (context.removedTurns > 0) {
@@ -925,6 +953,13 @@ async function runTurnWork(
           reasoningTokens += estimateTextTokens(event.text);
           if (turn.reasoningKey === null) {
             turn.reasoningKey = itemId(session, "reasoning", rounds);
+            emit([
+              {
+                kind: "item.open",
+                key: { providerItemId: turn.reasoningKey },
+                item: { type: "reasoning", content: [], summary: [] },
+              },
+            ]);
           }
           emit([
             {
@@ -1238,7 +1273,13 @@ const handlers: Record<string, RequestHandler> = {
         return;
       }
       try {
-        const requestBaseUrl = baseUrl(undefined, parsed.data.envVars);
+        // Turns resolve the endpoint as providerOptions.baseUrl first, then
+        // env; the picker must use the same resolution so its catalog and
+        // effort validation match what a turn will actually call.
+        const requestBaseUrl = baseUrl(
+          (parsed.data as { providerOptions?: unknown }).providerOptions,
+          parsed.data.envVars,
+        );
         const client = createNanoGptClient({
           baseUrl: requestBaseUrl,
           apiKey: key,
@@ -1248,8 +1289,7 @@ const handlers: Record<string, RequestHandler> = {
         const preferred = new Map(
           NANO_GPT_FALLBACK_MODELS.map((model, index) => [model.id, index]),
         );
-        const unique = [...new Set(ids)];
-        unique.sort((left, right) => {
+        const unique = ids.sort((left, right) => {
           return ((preferred.get(left) ?? Infinity) - (preferred.get(right) ?? Infinity)) || left.localeCompare(right);
         });
         const defaultId = unique.includes(NANO_GPT_DEFAULT_MODEL_ID) ? NANO_GPT_DEFAULT_MODEL_ID : unique[0];
@@ -1272,8 +1312,18 @@ const handlers: Record<string, RequestHandler> = {
           };
         });
         io.sendResult(id, { models, selectedOnlyModels: [] });
-      } catch {
-        io.sendResult(id, { models: [], selectedOnlyModels: [] });
+      } catch (error) {
+        // A catalog failure must not masquerade as "no models": the host
+        // would cache an empty list and hide the real reason. Report it as
+        // an error so bb retries the picker on demand.
+        if (process.env.NANOGPT_DEBUG_BRIDGE === "1") {
+          console.error("NanoGPT bridge: model/list failed.", error);
+        }
+        io.sendError(
+          id,
+          BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR,
+          `Could not load the NanoGPT model catalog: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     })();
   },
@@ -1418,6 +1468,21 @@ const handlers: Record<string, RequestHandler> = {
     if (session === undefined) {
       io.sendResult(id, {});
       return;
+    }
+    // Queued follow-ups were already acknowledged. Dropping them silently
+    // would leave accepted messages that never run and never report. A
+    // terminal boundary here would corrupt turn grouping for the history
+    // collector, so answer each with a non-terminal warning instead.
+    for (const queued of session.queue) {
+      if (queued.clientRequestId === undefined) continue;
+      emitDeltas(session.threadId, [
+        {
+          kind: "provider.warning",
+          category: "general",
+          summary: "A queued follow-up message was cancelled by Stop and was not sent to the model.",
+          details: queued.clientRequestId,
+        },
+      ]);
     }
     session.queue.length = 0;
     const activeTurn = session.activeTurn;

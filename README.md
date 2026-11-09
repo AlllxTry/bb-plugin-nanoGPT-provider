@@ -310,17 +310,25 @@ For every retryable HTTP status, `Retry-After` takes precedence over the local
 backoff. Both non-negative integer seconds (`Retry-After: 60`) and HTTP dates
 (`Retry-After: Mon, 09 Nov 2026 00:01:00 GMT`) are supported. A future date waits
 until that time; zero seconds or an elapsed date adds no delay. Malformed values
-fall back to the local backoff. Without a usable header, retry waits are about
-2, 4, and 8 seconds, each with up to 500 ms of jitter; local backoff is capped at
-10 seconds. A transport failure uses local backoff rather than reusing a header
-from an earlier response.
+fall back to the local backoff. Server-directed waits are capped at 120 seconds:
+a `Retry-After` beyond the cap fails the request immediately with the upstream
+status preserved, instead of parking the turn for minutes or hours. Waits within
+the cap are honoured even beyond the Node.js timer limit, and are split into
+intervals the runtime supports. Stop can cancel any wait without sending another
+request. Without a usable header, retry waits are about 2, 4, and 8 seconds, each
+with up to 500 ms of jitter; local backoff is capped at 10 seconds. A transport
+failure uses local backoff rather than reusing a header from an earlier response.
 
-Server-directed waits can exceed the local 10-second cap. Long waits are split
-into intervals supported by the runtime, and Stop can cancel the wait without
-sending another request. The 120-second request/read deadlines apply to network
-operations, not to the retry wait; there is no overall retry deadline. After
-four retryable HTTP failures, the reported error retains the final upstream
-status and message and includes the attempt count. For example:
+Transport failures are retried only when the error provably happened before the
+request reached the server (DNS resolution, connection refused, or an unreachable
+route). A failure while the request is in flight — a reset socket, a hang-up
+after the request was sent — fails the turn with an explanatory error and is
+**never** replayed, because a POST completion is not idempotent and a blind
+replay could bill the request twice.
+
+The 120-second request/read deadlines apply to network operations, not to the
+retry wait. After four retryable HTTP failures, the reported error retains the
+final upstream status and message and includes the attempt count. For example:
 `NanoGPT API error 429: Daily quota exhausted (after 4 attempts)`.
 
 ## Permissions and tools
@@ -373,12 +381,15 @@ that directory from releases.
 
 ## Context and attachment limits
 
-The catalog client retrieves IDs and optional reasoning metadata, without verified
-model context limits. The bridge therefore uses a local policy of 32,768 estimated
-tokens, with 4,096 reserved in the budget calculation and 28,672 available for
-input. This is not a claim that every model has that window, and the reservation
-does not set an upstream output-token limit. Smaller models can still reject a
-request; there is no automatic unchanged retry or paid summarization request.
+The catalog client retrieves IDs, optional reasoning metadata, and each model's
+optional advertised `context_length` when NanoGPT provides it. When a selected
+model advertises a sane context window, that window (minus a 4,096-token output
+reserve) becomes the input budget for its requests. Models without usable
+metadata — and advertised values above ten million tokens — fall back to the
+local policy of 32,768 estimated tokens, with 28,672 available for input. These
+are budgeting rules, not a claim that every model honors that window; smaller
+models can still reject a request, and there is no automatic unchanged retry or
+paid summarization request.
 
 Before every model round, the estimate covers system/instruction text, multipart
 text, tool definitions, tool-call arguments and tool replies. Text is estimated
@@ -389,12 +400,16 @@ image-resolution-based cost estimate. Usage reported by the API always takes
 precedence; fallback usage separately estimates generated text, reasoning and
 tool-call output for each round.
 
-When necessary, the bridge removes the oldest complete turns from model history,
-keeping the system message and the current turn intact. An assistant tool-call
-message is never separated from its tool replies. A visible notice explains that
-older context was excluded; the conversation displayed in bb remains intact.
-If the current turn alone exceeds the budget, it fails locally before another
-API request. Large assistant/tool outputs retained in history are bounded to
+When necessary, the bridge first removes the oldest complete turns from model
+history, keeping the system message and the current turn intact. An assistant
+tool-call message is never separated from its tool replies. If evicting old turns
+is still not enough, tool replies already produced **inside the current turn**
+are shortened in place to 2,000 characters each (with a visible marker), oldest
+first, so a multi-round turn keeps working instead of failing; the shortened
+forms are used for later model rounds only and the timeline in bb is unchanged.
+A visible notice explains when older context was excluded. If the current turn
+still exceeds the budget after that, it fails locally before another API
+request. Large assistant/tool outputs retained in history are bounded to
 24,000 UTF-8 bytes, keeping the beginning and end with a truncation marker.
 Visible streamed text and tool results are not replaced by that shortened copy.
 

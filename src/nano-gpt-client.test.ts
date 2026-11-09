@@ -109,17 +109,29 @@ describe("streamChatCompletion", () => {
       expect(vi.getTimerCount()).toBe(0);
     });
 
-    it("honors Retry-After delays beyond the Node.js timer limit", async () => {
+    it("refuses a Retry-After beyond the wait cap instead of sleeping for days", async () => {
+      vi.useFakeTimers();
+      const fetch = vi.fn(async () => new Response("wait", { status: 429, headers: { "Retry-After": "86400" } }));
+      const pending = collect(createNanoGptClient({ apiKey: "test", fetch }).streamChatCompletion({ model: "test", messages: [] }));
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      await expect(pending).rejects.toMatchObject({
+        name: "NanoGptApiError",
+        status: 429,
+        message: expect.stringMatching(/exceeds the retry wait limit/i),
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("waits for a Retry-After within the cap even beyond the Node.js timer limit", async () => {
       vi.useFakeTimers();
       const fetch = vi.fn()
-        .mockResolvedValueOnce(new Response("wait", { status: 429, headers: { "Retry-After": "2147484" } }))
+        .mockResolvedValueOnce(new Response("wait", { status: 429, headers: { "Retry-After": "119" } }))
         .mockImplementation(successfulResponse);
       const pending = collect(createNanoGptClient({ apiKey: "test", fetch }).streamChatCompletion({ model: "test", messages: [] }));
-      await vi.advanceTimersByTimeAsync(2_147_483_647);
+      await vi.advanceTimersByTimeAsync(119_000 - 1_000);
       expect(fetch).toHaveBeenCalledTimes(1);
-      await vi.advanceTimersByTimeAsync(352);
-      expect(fetch).toHaveBeenCalledTimes(1);
-      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(1_000);
       await pending;
       expect(fetch).toHaveBeenCalledTimes(2);
       expect(vi.getTimerCount()).toBe(0);
@@ -138,20 +150,29 @@ describe("streamChatCompletion", () => {
       expect(vi.getTimerCount()).toBe(0);
     });
 
-    it("uses local backoff after a network failure instead of an earlier Retry-After", async () => {
+    it("does not replay a sent request after an in-flight network failure", async () => {
       vi.useFakeTimers();
       const fetch = vi.fn()
-        .mockResolvedValueOnce(new Response("wait", { status: 429, headers: { "Retry-After": "60" } }))
-        .mockRejectedValueOnce(new TypeError("Connection reset"))
+        .mockResolvedValueOnce(new Response("wait", { status: 503, headers: { "Retry-After": "1" } }))
+        .mockRejectedValueOnce(Object.assign(new TypeError("socket hang up"), { cause: { code: "ECONNRESET" } }))
         .mockImplementation(successfulResponse);
       const pending = collect(createNanoGptClient({ apiKey: "test", fetch }).streamChatCompletion({ model: "test", messages: [] }));
-      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(pending).rejects.toMatchObject({
+        name: "NanoGptApiError",
+        message: expect.stringMatching(/not retried, because a replay could bill the request twice/i),
+      });
       expect(fetch).toHaveBeenCalledTimes(2);
-      await vi.advanceTimersByTimeAsync(3499);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("retries a connection-refused failure that provably never reached the server", async () => {
+      const fetch = vi.fn()
+        .mockRejectedValueOnce(Object.assign(new TypeError("connect ECONNREFUSED"), { cause: { code: "ECONNREFUSED" } }))
+        .mockImplementation(successfulResponse);
+      const events = await collect(createNanoGptClient({ apiKey: "test", fetch }).streamChatCompletion({ model: "test", messages: [] }));
       expect(fetch).toHaveBeenCalledTimes(2);
-      await vi.advanceTimersByTimeAsync(1001);
-      await pending;
-      expect(fetch).toHaveBeenCalledTimes(3);
+      expect(events).toContainEqual(expect.objectContaining({ type: "message", content: "ok" }));
     });
 
     it("does not retry non-transient HTTP errors", async () => {
@@ -634,20 +655,23 @@ describe("listModels", () => {
     ]);
   });
 
-  it("reads model-specific efforts from detailed catalog metadata", async () => {
+  it("reads model-specific efforts and context windows from detailed catalog metadata", async () => {
     const urls: string[] = [];
     const client = createNanoGptClient({ apiKey: "sk-nano-test", fetch: async (url) => {
       urls.push(String(url));
       return jsonResponse({ data: [
-        { id: "model/a", reasoning_efforts: ["low", "medium", "high"] },
-        { id: "model/b" },
+        { id: "model/a", reasoning_efforts: ["low", "medium", "high"], context_length: 131_072 },
+        { id: "model/b", context_length: null },
         { id: "model/c", reasoning_efforts: [] },
+        { id: "model/d", context_length: 1_000_000_000 },
       ] });
     } });
     await expect(client.listModelCatalog()).resolves.toEqual([
-      { id: "model/a", reasoningEfforts: ["low", "medium", "high"] },
-      { id: "model/b", reasoningEfforts: undefined },
-      { id: "model/c", reasoningEfforts: [] },
+      { id: "model/a", reasoningEfforts: ["low", "medium", "high"], contextLength: 131_072 },
+      { id: "model/b", reasoningEfforts: undefined, contextLength: null },
+      { id: "model/c", reasoningEfforts: [], contextLength: null },
+      // An implausible advertised window is clamped to the trusted bound.
+      { id: "model/d", reasoningEfforts: undefined, contextLength: 10_000_000 },
     ]);
     expect(urls).toEqual([`${NANO_GPT_DEFAULT_BASE_URL}/models?detailed=true`]);
   });

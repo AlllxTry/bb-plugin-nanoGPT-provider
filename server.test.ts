@@ -74,10 +74,12 @@ describe("the NanoGPT provider registration", () => {
       threadId: "thread", projectId: "project", model: "test",
       permissionMode: "full", promptMode: "plan", settings: {},
     })).toMatchObject({ promptMode: "plan" });
-    expect(() => declaration.deriveProviderOptions?.({
+    // An invalid saved endpoint is ignored, not thrown: derivation must keep
+    // working so the provider stays selectable while the URL is fixed.
+    expect(declaration.deriveProviderOptions?.({
       threadId: "thread", projectId: "project", model: "test", permissionMode: "full",
       settings: { baseUrl: "http://example.com/v1" },
-    })).toThrow(/Base URL/);
+    })).toMatchObject({ baseUrl: null, promptMode: null });
   });
 
   it("registers the provider with no models until a key is accepted", () => {

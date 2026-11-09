@@ -77,6 +77,9 @@ deny dispatched none; Stop followed by late allow dispatched none and produced a
 interrupted boundary; configured denial dispatched none and raised no approval.
 This smoke does not establish live NanoGPT HTTP behavior or installed bb UI
 interaction cleanup. It uses only a synthetic key and simulated execution results.
+The script is a local development tool: `dev_docs/` is excluded from the
+repository by `.gitignore`, so this paragraph documents how it was run rather
+than shipping the script.
 
 ### Manual approval contract and limits
 

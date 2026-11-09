@@ -130,11 +130,23 @@ export default function plugin(bb: BbPluginApi) {
     baseUrl: string | null;
   }> {
     const values = await settings.get();
-    const baseUrl = (values.baseUrl ?? "").trim();
-    return {
-      apiKey: (values.apiKey ?? "").trim(),
-      baseUrl: baseUrl === "" ? null : normalizeBaseUrl(baseUrl),
-    };
+    const apiKey = (values.apiKey ?? "").trim();
+    const rawBaseUrl = (values.baseUrl ?? "").trim();
+    let baseUrl: string | null = null;
+    if (rawBaseUrl !== "") {
+      try {
+        baseUrl = normalizeBaseUrl(rawBaseUrl);
+      } catch {
+        // A base URL saved through a path this plugin does not validate (for
+        // example bb's native settings page) must not break getStatus, env
+        // contribution or provider options. Ignore it and fall back to the
+        // default endpoint; the key stays untouched.
+        bb.log.warn(
+          `Ignoring a saved NanoGPT base URL that is not a valid endpoint: ${rawBaseUrl.slice(0, 120)}`,
+        );
+      }
+    }
+    return { apiKey, baseUrl };
   }
 
   async function usableCredentials(): Promise<{
@@ -249,11 +261,16 @@ export default function plugin(bb: BbPluginApi) {
     models: { fallback: [], scope: "host" },
     env: { passthrough: [NANO_GPT_API_KEY_ENV, NANO_GPT_BASE_URL_ENV] },
     deriveProviderOptions(context): NanoGptProviderOptions {
-      const baseUrl =
-        typeof context.settings.baseUrl === "string" &&
-        context.settings.baseUrl.trim() !== ""
-          ? normalizeBaseUrl(context.settings.baseUrl)
-          : null;
+      let baseUrl: string | null = null;
+      if (typeof context.settings.baseUrl === "string" && context.settings.baseUrl.trim() !== "") {
+        try {
+          baseUrl = normalizeBaseUrl(context.settings.baseUrl);
+        } catch {
+          // Same guard as readSaved: an invalid saved endpoint must not
+          // break option derivation for the whole provider.
+          bb.log.warn("Ignoring an invalid saved NanoGPT base URL during option derivation.");
+        }
+      }
       return {
         model: context.model,
         baseUrl,

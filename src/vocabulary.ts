@@ -84,6 +84,8 @@ export const RETRY_CONFIG = {
   maxRetries: 3,
   baseDelayMs: 1000,
   maxDelayMs: 10_000,
+  /** Cap for server-directed Retry-After waits; longer waits fail the request. */
+  maxRetryAfterMs: 120_000,
   jitterMs: 500,
   retryableStatusCodes: [429, 502, 503, 504] as const,
 };

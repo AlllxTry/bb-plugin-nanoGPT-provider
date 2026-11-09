@@ -19,10 +19,13 @@ export function encodeContextCheckpoint(value: ContextCheckpoint): string {
 
 export function decodeContextCheckpoint(value: unknown): ContextCheckpoint | null {
   if (typeof value !== "string" || !value.startsWith(CHECKPOINT_PREFIX)) return null;
+  // A corrupt or foreign checkpoint must never break the whole thread: a
+  // resumed session falls back to pre-checkpoint legacy reconstruction
+  // instead of failing on every turn.
   try {
     return contextCheckpointSchema.parse(JSON.parse(Buffer.from(value.slice(CHECKPOINT_PREFIX.length), "base64url").toString("utf8")));
   } catch {
-    throw new Error("bb history contains an invalid NanoGPT context checkpoint.");
+    return null;
   }
 }
 

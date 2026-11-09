@@ -70,15 +70,21 @@ describe("the NanoGPT settings RPC", () => {
     await expect(pending).resolves.toEqual([]);
   });
 
-  it("rejects unsafe URLs from RPC and saved settings without checking a key", async () => {
+  it("ignores unsafe saved URLs instead of failing status, without checking a key", async () => {
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
     const host = loadPlugin();
     await expect(host.harness.behavior.callRpc("saveKey", { apiKey: "test", baseUrl: "http://example.com/v1" })).rejects.toThrow();
+    // A URL saved through a path this plugin does not validate must not break
+    // status or env contribution: it is ignored in favor of the default.
     await host.harness.behavior.setSettings({ apiKey: "test", baseUrl: "http://example.com/v1" });
-    await expect(host.harness.behavior.callRpc("getStatus", null)).rejects.toThrow(/Base URL/);
+    // The invalid saved URL is ignored; status resolves instead of throwing.
+    // It now reaches the default endpoint for the key verdict (the broken URL
+    // no longer aborts the RPC), which is exactly the M4 fix.
+    await expect(host.harness.behavior.callRpc("getStatus", null)).resolves.toMatchObject({ state: "unknown", baseUrl: "" });
     await expect(host.harness.behavior.resolveProviderEnv(NANO_GPT_PROVIDER_ID, ENV_CONTEXT)).resolves.toEqual([]);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(String((fetch as ReturnType<typeof vi.fn>).mock.calls[0]?.[0])).toBe("https://api.nano-gpt.com/api/check-balance");
   });
 
   it("updates the server health contribution when the saved key is added and removed", async () => {
