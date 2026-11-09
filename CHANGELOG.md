@@ -5,6 +5,34 @@ reads when you install or update the plugin.
 
 ## Unreleased
 
+_None yet. Release 0.1.5 is the current tagged release._
+
+## 0.1.5 — 2026-11-09
+
+- Add a Tool controls panel and independent RPCs for exact tool denials and
+  optional one-time manual confirmations. Carry validated controls in public
+  provider options so configured denials work without bb forwarding the native
+  denylist. Preserve each submitted turn's settings snapshot. Validate approval
+  replies with the SDK contract, reject broader grants and malformed/error replies,
+  cancel on Stop/release/replacement, ignore late responses, and redact credential
+  fields in reviews. Refuse reviews that cannot fit the SDK's 280-character
+  presentation limit. Automatic review and workspace confinement remain unsupported.
+  Verification: 280 tests, typecheck, build, and four offline built-host protocol
+  smoke scenarios passed. Live approval UI/daemon behavior remains unverified.
+- Preserve bb's complete permission policy in immutable per-request options and
+  reject unsupported modes before acknowledging input or changing sessions.
+  Keep the advertised modes limited to full until workspace/reviewer enforcement
+  is available. Enforce exact session tool denials in model definitions and
+  dispatch, reject duplicate names, and restrict the hidden history tool to
+  bridge restoration. Missing/denied history retrieval stops resumed generation.
+  Add 31 regression tests; the inspected bb adapter still needs denylist
+  forwarding, and general approval review remains unsupported.
+- Document the permission/tool audit: full-only capability declaration, dropped
+  policy fields, ignored session tool denylist, and separate tool/approval routing.
+  Record that dynamic tools still work and available Git history shows these
+  permission gaps from the initial commit. Reproduce the gaps with 17 isolated
+  local audit probes, including queued turns and resumed history retrieval.
+  Follow-up behavior fixes are described above.
 - Honor `Retry-After` seconds and HTTP dates for every retryable completion
   status (429, 502, 503, 504), keep long waits cancellable without timer overflow,
   and use local backoff after a subsequent transport failure. Exhausted HTTP
@@ -13,6 +41,11 @@ reads when you install or update the plugin.
 - Add model-specific Low, Medium, and High reasoning effort choices when NanoGPT
   declares support. Explicit choices are validated and sent as `reasoning_effort`;
   Provider default omits the field and preserves the old saved `medium` behavior.
+- Make default-only reasoning records authoritative to bb so stale explicit
+  choices are removed after metadata loss. Refresh once when cached metadata
+  rejects an explicit effort, and share one model-list deadline across detailed
+  discovery and basic fallback. Dedicated regression and live acceptance checks
+  remain open; see [the reasoning guide](docs/REASONING_EFFORT.md).
 - Restore NanoGPT model context from bb's saved event history after provider
   session resume. History is fetched through a bounded hidden tool before the
   first model request; failed retrieval fails the turn instead of silently

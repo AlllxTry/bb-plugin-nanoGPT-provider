@@ -61,6 +61,7 @@ describe("the NanoGPT provider registration", () => {
 
   it("exposes plan mode and supported reasoning option descriptors", () => {
     const { declaration } = registeredDeclaration();
+    expect(declaration.capabilities.permissionModes).toEqual(["full"]);
     expect(declaration.composerActions).toEqual(["plan"]);
     expect(declaration.capabilities.reasoningLevels).toEqual(["medium"]);
     expect(declaration.reasoningLevels).toEqual(expect.arrayContaining([

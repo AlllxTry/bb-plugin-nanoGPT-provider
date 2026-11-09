@@ -1,6 +1,7 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { checkApiKey, createApiKeyGate } from "./src/api-key-gate.js";
 import { normalizeBaseUrl } from "./src/base-url.js";
+import { configuredToolDenials, NANO_GPT_PERMISSION_MODES, toolControlsSchema } from "./src/permissions.js";
 import {
   nanoGptSettingsContract,
   REALTIME_KEY_STATE_CHANNEL,
@@ -86,6 +87,18 @@ export default function plugin(bb: BbPluginApi) {
   }));
 
   const settings = bb.settings.define({
+    disallowedTools: {
+      type: "string",
+      label: "Disallowed tools",
+      description: "Exact tool names separated by commas or whitespace. Applies to new turns; no wildcards.",
+      default: "",
+    },
+    confirmToolCalls: {
+      type: "boolean",
+      label: "Confirm tool calls",
+      description: "Ask for one-time user approval before ordinary model tool calls. This does not add workspace isolation or automatic review.",
+      default: false,
+    },
     apiKey: {
       type: "string",
       label: "NanoGPT API key",
@@ -151,6 +164,18 @@ export default function plugin(bb: BbPluginApi) {
   }
 
   bb.rpc.register(nanoGptSettingsContract, {
+    async getToolSettings() {
+      const values = await settings.get();
+      return {
+        disallowedTools: configuredToolDenials(values.disallowedTools).join("\n"),
+        confirmToolCalls: values.confirmToolCalls ?? false,
+      };
+    },
+    async saveToolSettings(input) {
+      const next = { ...input, disallowedTools: configuredToolDenials(input.disallowedTools).join("\n") };
+      await settings.experimental_set(next);
+      return next;
+    },
     getStatus: () => status(),
 
     async saveKey({ apiKey, baseUrl }) {
@@ -209,7 +234,7 @@ export default function plugin(bb: BbPluginApi) {
       supportsManualCompaction: false,
       supportsThreadArchive: false,
       supportsThreadRename: false,
-      permissionModes: ["full"],
+      permissionModes: [...NANO_GPT_PERMISSION_MODES],
       reasoningLevels: ["medium"],
     },
     reasoningLevels: [
@@ -233,6 +258,10 @@ export default function plugin(bb: BbPluginApi) {
         model: context.model,
         baseUrl,
         promptMode: context.promptMode ?? null,
+        ...toolControlsSchema.parse({
+          disallowedTools: configuredToolDenials(context.settings.disallowedTools),
+          confirmToolCalls: context.settings.confirmToolCalls ?? false,
+        }),
       };
     },
   });

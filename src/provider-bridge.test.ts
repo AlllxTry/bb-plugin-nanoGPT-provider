@@ -407,7 +407,7 @@ describe("the NanoGPT bridge", () => {
       ],
     });
     expect(models.find((model) => model.id === "legacy/model")).toMatchObject({
-      reasoningDiscovery: "unknown",
+      reasoningDiscovery: "known",
       supportedReasoningEfforts: [{ reasoningEffort: "nanogpt:provider-default" }],
     });
     responses.push(new Response(JSON.stringify({ data: [{ id: "empty/model", reasoning_efforts: [] }] })));

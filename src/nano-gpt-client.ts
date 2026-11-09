@@ -375,23 +375,47 @@ export function createNanoGptClient(args: {
     }, signal, MODEL_LIST_TIMEOUT_MS, "The NanoGPT model list timed out. Please try again.");
   }
 
+  /** Fetches models without adding an internal deadline; relies on caller's deadline. */
+  async function fetchModelsNoDeadline(url: string, signal?: AbortSignal): Promise<NanoGptModelCatalogEntry[]> {
+    const response = await raceAbort(
+      fetchImpl(url, { method: "GET", headers: authHeaders(), signal }),
+      signal,
+      discardLateResponse,
+    );
+    if (!response.ok) await fail(response, signal);
+    const parsed = modelListSchema.safeParse(await raceAbort(response.json(), signal));
+    if (!parsed.success) {
+      throw new NanoGptApiError({
+        status: response.status,
+        message: "NanoGPT model list response had an unexpected shape",
+      });
+    }
+    return parsed.data.data.map((model) => ({
+      id: model.id,
+      reasoningEfforts: model.reasoning_efforts,
+    }));
+  }
+
   return {
     async listModels(signal) {
       return (await fetchModels(`${baseUrl}/models`, signal)).map((model) => model.id);
     },
 
     async listModelCatalog(signal) {
-      try {
-        return await fetchModels(`${baseUrl}/models?detailed=true`, signal);
-      } catch (error) {
-        if (!(error instanceof NanoGptApiError) || ![400, 404, 405, 422].includes(error.status)) {
-          throw error;
+      return withDeadline(async (deadlineSignal) => {
+        try {
+          return await fetchModelsNoDeadline(`${baseUrl}/models?detailed=true`, deadlineSignal);
+        } catch (error) {
+          if (!(error instanceof NanoGptApiError) || ![400, 404, 405, 422].includes(error.status)) {
+            throw error;
+          }
+          const basic = await fetchModelsNoDeadline(`${baseUrl}/models`, deadlineSignal);
+          return basic.map((model) => ({
+            id: model.id,
+            reasoningEfforts: undefined,
+          }));
         }
-        return (await fetchModels(`${baseUrl}/models`, signal)).map((model) => ({
-          id: model.id,
-          reasoningEfforts: undefined,
-        }));
-      }
+      }, signal, MODEL_LIST_TIMEOUT_MS, "The NanoGPT model list timed out. Please try again.");
     },
 
     async *streamChatCompletion(streamArgs) {

@@ -1,4 +1,5 @@
 import {
+  type BridgeExecutionOptions,
   type ClientTurnRequestId,
   type DynamicTool,
   type PromptInput,
@@ -31,6 +32,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { describeAttachedFile, readAttachedImage, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES } from "./attachments.js";
 import { normalizeBaseUrl } from "./base-url.js";
+import { toolControlsSchema, unsupportedPermissionPolicy, type ToolControls } from "./permissions.js";
+import { toolApprovalAllowed, toolApprovalPresentation } from "./tool-approval.js";
 import { boundedHistoryText, estimateTextTokens, fitContext } from "./context.js";
 import { restoreNanoGptHistory } from "./history-adapter.js";
 import {
@@ -87,6 +90,7 @@ interface Session {
   providerThreadId: string;
   cwd: string;
   tools: ReadonlyMap<string, DynamicTool>;
+  disallowedTools: ReadonlySet<string>;
   messages: NanoGptMessage[];
   completedTurnEnds: number[];
   turnCounter: number;
@@ -118,13 +122,7 @@ interface ActiveTurn {
   unansweredToolCalls: string[];
 }
 
-interface TurnOptions {
-  model: string | undefined;
-  reasoningLevel: string | undefined;
-  instructions: string | undefined;
-  providerOptions: unknown;
-  envVars: Record<string, string> | undefined;
-}
+type TurnOptions = Readonly<BridgeExecutionOptions>;
 
 const sessions = new Map<string, Session>();
 
@@ -215,6 +213,10 @@ interface PendingToolCall {
 }
 
 const pendingToolCalls = new Map<string, PendingToolCall>();
+const pendingApprovals = new Map<string, {
+  session: Session;
+  resolve: (allowed: boolean) => void;
+}>();
 
 function apiKey(envVars: Record<string, string> | undefined): string {
   return (envVars?.[NANO_GPT_API_KEY_ENV] ?? "").trim();
@@ -247,7 +249,8 @@ function openSession(args: {
   threadId: string;
   providerThreadId: string;
   cwd: string;
-  dynamicTools: readonly DynamicTool[] | undefined;
+  tools: ReadonlyMap<string, DynamicTool>;
+  disallowedTools: readonly string[] | undefined;
   restorationRequired: boolean;
 }): Session {
   const previous = sessions.get(args.threadId);
@@ -262,9 +265,8 @@ function openSession(args: {
     threadId: args.threadId,
     providerThreadId: args.providerThreadId,
     cwd: args.cwd,
-    tools: new Map(
-      (args.dynamicTools ?? []).map((tool) => [tool.name, tool]),
-    ),
+    tools: args.tools,
+    disallowedTools: new Set(args.disallowedTools ?? []),
     messages: [],
     completedTurnEnds: [],
     turnCounter: 0,
@@ -349,8 +351,8 @@ function setSystemMessage(session: Session, options: TurnOptions, planMode: bool
   session.messages.unshift({ role: "system", content: text });
 }
 
-function toolDefinitions(session: Session): NanoGptToolDefinition[] {
-  return [...session.tools.values()].filter((tool) => tool.name !== HISTORY_TOOL_NAME).map((tool) => ({
+function toolDefinitions(session: Session, controls: ToolControls): NanoGptToolDefinition[] {
+  return [...session.tools.values()].filter((tool) => toolRejection(session, tool.name, "model", controls) === null).map((tool) => ({
     type: "function" as const,
     function: {
       name: tool.name,
@@ -364,6 +366,7 @@ async function restoreSessionHistory(
   session: Session,
   currentRequestId: ClientTurnRequestId | undefined,
   signal: AbortSignal,
+  controls: ToolControls,
 ): Promise<void> {
   const rows: unknown[] = [];
   let afterSeq: number | null = null;
@@ -376,6 +379,8 @@ async function restoreSessionHistory(
       HISTORY_TOOL_NAME,
       { afterSeq, throughSeq, currentRequestId: currentRequestId ?? null },
       signal,
+      "history",
+      controls,
     );
     if (result.isError) throw new Error(`bb history could not be loaded: ${result.content}`);
     let envelope: unknown;
@@ -445,25 +450,89 @@ const CANCELLED_TOOL_REPLY = {
   isError: true,
 } as const;
 
-/**
- * Asks bb to run a tool. The returned promise always settles: either bb
- * answers, or the turn is aborted and the pending entry is removed.
- */
-function requestToolCall(
+type ToolCallSource = "model" | "history";
+
+/** One eligibility rule for both advertised definitions and actual dispatch. */
+function toolRejection(session: Session, tool: string, source: ToolCallSource, controls: ToolControls): string | null {
+  if (session.disallowedTools.has(tool) || controls.disallowedTools.includes(tool)) {
+    return `Error: tool "${tool}" is disallowed for this session. The tool was not run.`;
+  }
+  if (tool === HISTORY_TOOL_NAME && source !== "history") {
+    return `Error: tool "${tool}" is reserved for internal history restoration. The tool was not run.`;
+  }
+  if (!session.tools.has(tool) || (source === "history" && tool !== HISTORY_TOOL_NAME)) {
+    return `Error: unknown tool "${tool}". The tool was not run. Use only the tools provided for this session.`;
+  }
+  return null;
+}
+
+function requestToolApproval(
   session: Session,
   callId: string,
   tool: string,
   args: Record<string, unknown>,
   signal: AbortSignal,
+): Promise<{ content: string; isError: true } | null> {
+  const presentation = toolApprovalPresentation(tool, args);
+  if (presentation === null) return Promise.resolve({ content: "Tool arguments are too large to review within bb's approval presentation limit. The tool was not run.", isError: true });
+  if (signal.aborted) return Promise.resolve(CANCELLED_TOOL_REPLY);
+  const id = `nano-gpt-req-${++outboundRequestCounter}`;
+  return new Promise((resolve) => {
+    const onAbort = () => finish(false);
+    const finish = (allowed: boolean) => {
+      if (!pendingApprovals.delete(id)) return;
+      signal.removeEventListener("abort", onAbort);
+      resolve(allowed && !signal.aborted && sessions.get(session.threadId) === session
+        ? null
+        : { content: "Tool approval was denied, cancelled, or unavailable. The tool was not run.", isError: true });
+    };
+    pendingApprovals.set(id, { session, resolve: finish });
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      io.send({ jsonrpc: "2.0", id, method: BRIDGE_INBOUND_REQUEST_METHODS.interactionRequest, params: {
+        threadId: session.threadId,
+        providerThreadId: session.providerThreadId,
+        turnId: null,
+        payload: {
+          kind: "approval",
+          availableDecisions: ["allow_once", "deny"],
+          reason: "NanoGPT tool confirmation is enabled for this turn.",
+          subject: { kind: "tool_use", itemId: callId, tool, presentation },
+        },
+      } });
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+/**
+ * Asks bb to run a tool. The returned promise always settles: either bb
+ * answers, or the turn is aborted and the pending entry is removed.
+ */
+async function requestToolCall(
+  session: Session,
+  callId: string,
+  tool: string,
+  args: Record<string, unknown>,
+  signal: AbortSignal,
+  source: ToolCallSource,
+  controls: ToolControls,
 ): Promise<{ content: string; isError: boolean }> {
   if (signal.aborted) {
     return Promise.resolve(CANCELLED_TOOL_REPLY);
   }
-  if (!session.tools.has(tool)) {
+  const rejection = toolRejection(session, tool, source, controls);
+  if (rejection !== null) {
     return Promise.resolve({
-      content: `Error: unknown tool "${tool}". The tool was not run. Use only the tools provided for this session.`,
+      content: rejection,
       isError: true,
     });
+  }
+  if (source === "model" && controls.confirmToolCalls) {
+    const denied = await requestToolApproval(session, callId, tool, args, signal);
+    if (signal.aborted || sessions.get(session.threadId) !== session) return CANCELLED_TOOL_REPLY;
+    if (denied !== null) return denied;
   }
   const requestId = sendRequest(BRIDGE_INBOUND_REQUEST_METHODS.toolCall, {
     providerThreadId: session.providerThreadId,
@@ -761,14 +830,27 @@ async function runTurnWork(
     requestBaseUrl = baseUrl(args.options.providerOptions, args.options.envVars);
     const client = createNanoGptClient({ baseUrl: requestBaseUrl, apiKey: key });
     if (reasoningSelection.kind === "explicit") {
-      const catalog = await modelCatalog(client, requestBaseUrl, key, signal);
-      assertModelEffort(reasoningSelection, catalog.get(model));
+      const cacheKey = modelCatalogCacheKey(requestBaseUrl, key);
+      const hadCachedEntry = modelCatalogCache.has(cacheKey) && modelCatalogCache.get(cacheKey)!.expiresAt > Date.now();
+      let catalog = await modelCatalog(client, requestBaseUrl, key, signal);
+      try {
+        assertModelEffort(reasoningSelection, catalog.get(model));
+      } catch (err) {
+        // Cached catalog doesn't support the explicit effort; try one bounded refresh
+        // only if we originally hit the cache (to avoid double-fetch on cold start).
+        if (hadCachedEntry) {
+          catalog = await modelCatalog(client, requestBaseUrl, key, signal, true);
+          assertModelEffort(reasoningSelection, catalog.get(model));
+        } else {
+          throw err;
+        }
+      }
       reasoningEffort = reasoningSelection.effort;
     }
     const planMode = providerOptions.promptMode === "plan";
     setSystemMessage(session, args.options, planMode);
     if (session.restorationRequired) {
-      await restoreSessionHistory(session, args.clientRequestId, signal);
+      await restoreSessionHistory(session, args.clientRequestId, signal, toolControlsSchema.parse(args.options.providerOptions ?? {}));
       if (turn.settled || signal.aborted) throw abortError();
     }
     historyMark = session.messages.length;
@@ -776,7 +858,8 @@ async function runTurnWork(
     const content = await userContent(args.input, signal);
     if (turn.settled || signal.aborted) throw abortError();
     session.messages.push({ role: "user", content });
-    const tools = planMode ? [] : toolDefinitions(session);
+    const controls = toolControlsSchema.parse(args.options.providerOptions ?? {});
+    const tools = planMode ? [] : toolDefinitions(session, controls);
     let rounds = 0;
     while (true) {
       rounds += 1;
@@ -984,6 +1067,8 @@ async function runTurnWork(
           call.function.name,
           toolArgs,
           signal,
+          "model",
+          controls,
         );
         if (signal.aborted || turn.settled || sessions.get(threadId) !== session) {
           // Left in openTools and unansweredToolCalls on purpose: settleTurn
@@ -1078,20 +1163,40 @@ function healthResult(): ProviderHealthResult {
   };
 }
 
-function turnOptionsOf(options: {
-  model?: string;
-  reasoningLevel?: string;
-  instructions?: string;
-  providerOptions?: Record<string, unknown>;
-  envVars?: Record<string, string>;
-}): TurnOptions {
-  return {
-    model: options.model,
-    reasoningLevel: options.reasoningLevel,
-    instructions: options.instructions,
-    providerOptions: options.providerOptions ?? {},
-    envVars: options.envVars,
-  };
+function turnOptionsOf(options: BridgeExecutionOptions): TurnOptions {
+  // The SDK has validated the full policy tuple. Retain its scalar fields in an
+  // immutable per-request snapshot, including when the request is queued.
+  return Object.freeze({
+    ...options,
+    providerOptions: structuredClone(options.providerOptions ?? {}),
+    envVars: options.envVars === undefined ? undefined : { ...options.envVars },
+  });
+}
+
+function acceptsPermissionPolicy(id: JsonRpcId, options: BridgeExecutionOptions): boolean {
+  const message = unsupportedPermissionPolicy(options);
+  if (message !== null) {
+    io.sendError(id, BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS, message);
+    return false;
+  }
+  const controls = toolControlsSchema.safeParse(options.providerOptions ?? {});
+  if (!controls.success) {
+    invalidParams(id, "tool controls", controls.error.issues);
+    return false;
+  }
+  return true;
+}
+
+function sessionTools(id: JsonRpcId, definitions: readonly DynamicTool[] | undefined): ReadonlyMap<string, DynamicTool> | null {
+  const tools = new Map<string, DynamicTool>();
+  for (const tool of definitions ?? []) {
+    if (tools.has(tool.name)) {
+      io.sendError(id, BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS, `Duplicate dynamic tool name "${tool.name}".`);
+      return null;
+    }
+    tools.set(tool.name, tool);
+  }
+  return tools;
 }
 
 type RequestHandler = (id: JsonRpcId, params: unknown) => void;
@@ -1147,15 +1252,18 @@ const handlers: Record<string, RequestHandler> = {
         });
         const defaultId = unique.includes(NANO_GPT_DEFAULT_MODEL_ID) ? NANO_GPT_DEFAULT_MODEL_ID : unique[0];
         const models = unique.map((id) => {
-          const options = reasoningOptions(catalogEfforts(catalog.get(id)));
+          const entry = catalog.get(id);
+          const options = reasoningOptions(catalogEfforts(entry));
           return {
             id,
             model: id,
             displayName: modelDisplayName(id),
             description: "Chat model routed through NanoGPT.",
-            reasoningDiscovery: Array.isArray(catalog.get(id)?.reasoningEfforts) &&
-              (catalog.get(id)?.reasoningEfforts as unknown[]).every((effort) => typeof effort === "string")
-              ? "known" as const : "unknown" as const,
+            // The plugin always offers a complete, authoritative option set: when
+            // NanoGPT omits or malforms `reasoning_efforts`, only Provider default
+            // is offered. Reporting "known" stops bb's catalog store from keeping
+            // stale explicit options that the current catalog no longer verifies.
+            reasoningDiscovery: "known" as const,
             supportedReasoningEfforts: options.map(({ reasoningEffort, label, description }) => ({ reasoningEffort, label, description })),
             defaultReasoningEffort: options[0]!.reasoningEffort,
             isDefault: id === defaultId,
@@ -1191,13 +1299,17 @@ const handlers: Record<string, RequestHandler> = {
       );
       return;
     }
+    if (!acceptsPermissionPolicy(id, parsed.data.options)) return;
+    const tools = sessionTools(id, parsed.data.dynamicTools);
+    if (tools === null) return;
     threadCounter += 1;
     const providerThreadId = `nano_gpt_${instanceNonce}_${threadCounter}`;
     const session = openSession({
       threadId: parsed.data.threadId,
       providerThreadId,
       cwd: parsed.data.cwd,
-      dynamicTools: parsed.data.dynamicTools,
+      tools,
+      disallowedTools: parsed.data.disallowedTools,
       restorationRequired: false,
     });
     io.sendResult(id, { providerThreadId, sessionRestorable: true });
@@ -1222,11 +1334,15 @@ const handlers: Record<string, RequestHandler> = {
       );
       return;
     }
+    if (!acceptsPermissionPolicy(id, parsed.data.options)) return;
+    const tools = sessionTools(id, parsed.data.dynamicTools);
+    if (tools === null) return;
     openSession({
       threadId: parsed.data.threadId,
       providerThreadId: parsed.data.providerThreadId,
       cwd: parsed.data.cwd,
-      dynamicTools: parsed.data.dynamicTools,
+      tools,
+      disallowedTools: parsed.data.disallowedTools,
       restorationRequired: true,
     });
     io.sendResult(id, {
@@ -1241,6 +1357,7 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.turnStart, parsed.error.issues);
       return;
     }
+    if (!acceptsPermissionPolicy(id, parsed.data.options)) return;
     const session = sessions.get(parsed.data.threadId);
     if (session === undefined) {
       io.sendError(
@@ -1266,6 +1383,7 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.turnSteer, parsed.error.issues);
       return;
     }
+    if (!acceptsPermissionPolicy(id, parsed.data.options)) return;
     const session = sessions.get(parsed.data.threadId);
     if (session === undefined || session.activeTurn === null) {
       io.sendError(
@@ -1348,6 +1466,11 @@ const jsonRpcResponseSchema = z
 function handleResponse(message: unknown): void {
   const parsed = jsonRpcResponseSchema.safeParse(message);
   if (!parsed.success || typeof parsed.data.id !== "string") {
+    return;
+  }
+  const approval = pendingApprovals.get(parsed.data.id);
+  if (approval !== undefined) {
+    approval.resolve(parsed.data.error === undefined && toolApprovalAllowed(parsed.data.result));
     return;
   }
   const pending = pendingToolCalls.get(parsed.data.id);

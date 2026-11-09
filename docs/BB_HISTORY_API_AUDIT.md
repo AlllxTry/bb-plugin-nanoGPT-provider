@@ -1,11 +1,19 @@
 # bb Conversation History API Audit
 
 - **Audit date:** 2026-11-09.
-- **Scope:** Phase 1 of `dev_docs/PLAN_PERSISTENCE.md`; investigation only.
+- **Scope:** Public history-API contract/source audit, with follow-up notes for the implemented adapter and transport.
 - **Installed SDK:** `@get-bb/plugin-sdk` 0.6.133.
 - **Matching local bb source:** `C:\Projects\bb\src`, declaring SDK 0.6.133 and `bb-app` 0.49.0.
 
 ## Decision
+
+Permission follow-up: the bridge now explicitly rejects model calls to the hidden
+history tool, enforces session denials on internal retrieval, and rejects duplicate
+tool identities. A missing or denied retrieval tool fails resume before generation.
+The initial permission audit overstated baseline dispatch isolation: hiding the
+tool definition alone did not prevent a returned model call. That dispatch guard
+is now implemented and regression-tested; see
+[the permission guide](PERMISSIONS_AND_TOOLS.md).
 
 bb exposes its saved thread event stream to plugin server code through `bb.sdk.threads.events.list()`. This is the preferred source for restoring NanoGPT conversation context. A duplicate SQLite transcript is not justified by the API findings.
 
@@ -55,7 +63,12 @@ The protocol uses `providerThreadId` as a durable provider-session handle. bb pe
 
 ### Current plugin behavior
 
-`src/provider-bridge.ts` creates `messages: []` in `openSession()`. Both start and resume use that function. Its capability flags remain false, accurately reflecting the current implementation.
+`src/provider-bridge.ts` creates `messages: []` in `openSession()`. Both start and
+resume use that function. Resume sets `restorationRequired: true`; its first
+active turn loads saved events before adding the current prompt or calling
+NanoGPT. The current bridge advertises `sessionRestore: true` and returns
+`sessionRestorable: true` for start/resume. Those flags describe the implemented
+path; a real daemon-restart check remains outstanding.
 
 `sessionRestorable` refines the handshake's restoration capability and affects runtime lifecycle decisions, including whether an idle session may be released. It must not be enabled merely because a history endpoint exists.
 
@@ -248,9 +261,12 @@ Source inspection confirms:
 
 This supports lazy retrieval after the first new turn opens and **before** its input is appended to restored history or any NanoGPT request is sent. The implementation fixes an upper sequence boundary on the first page, limits pages to 25 events and scans to 400 pages, validates each returned row and thread, and keeps the reconstruction temporary until the final page arrives. Cancellation propagates through bb's native-tool request. Automated adapter, server and bridge tests cover representative reconstruction, fixed-boundary server pagination using the SDK fake host, hidden-tool transport response handling, and fail-closed behavior. Real bb server and restart verification remain outstanding.
 
-### Suggested transport contract, not an existing bb API
+### Implemented plugin-owned contract
 
-A new plugin-owned tool could accept page cursors and return an envelope such as:
+`nanogpt_restore_history` accepts `afterSeq`, `throughSeq`, and `currentRequestId`
+(nullable values), and returns the following versioned envelope. This is the
+plugin's contract, rather than a new bb SDK method. The server binds thread identity
+to tool execution context; callers do not supply an arbitrary thread ID.
 
 ```typescript
 type HistoryPage = {
@@ -294,7 +310,7 @@ The adapter and transport must implement these rules:
 7. **Retention and size:** preserve truncation markers, adapt page size on 413 where possible, and fail explicitly when required data is unavailable. Apply the existing model budget after reconstruction.
 8. **Lifecycle:** serialize restoration with the session queue; ignore late responses after Stop, release, replacement, or plugin disposal.
 9. **Atomic publication:** construct context separately and install it only when the whole bounded reconstruction succeeds. Do not leave a half-restored session available for a model request.
-10. **Capability accuracy:** keep restoration flags false until the selected behavior, failure handling, and supported version range pass integration verification.
+10. **Capability accuracy:** verify the advertised restoration behavior against supported bb versions before release. The current implementation sets the flags true; live restart verification remains open and must not be implied by unit tests.
 
 ## 8. Checks Performed and Remaining Work
 
@@ -312,7 +328,13 @@ The adapter and transport must implement these rules:
 | TypeScript validation | Passed after the Phase 3 implementation. |
 | Historical attachment restaging and rewrite-race handling | Open integration requirements; full parity not established. |
 
-Phase 1 is complete as a contract/source audit, and Phases 2-3 have implementation code. The next step is Phase 4: verify the native-tool request/response channel, then inspect the first outgoing NanoGPT request after a real bridge/daemon restart. No tests were run during the Phase 3 implementation.
+The contract/source audit and adapter/transport implementation are complete.
+Automated coverage now exercises reconstruction, server pagination and the bridge's
+first-request restoration path. On 2026-11-09, the current full repository suite
+passed all **215 tests across 12 files**, and type checking passed. These local
+checks do not exercise a real daemon restart, historical attachment restaging,
+or concurrent history rewrites. The next integration step is to verify the real
+native-tool channel and inspect the first outgoing NanoGPT request after restart.
 
 ## Source Index
 

@@ -5,7 +5,9 @@ Pick NanoGPT in the provider list, choose any of its models, and run bb threads 
 - A gear in the composer that opens a small form for your API key, so setup doesn't send you to the plugin list.
 - The live NanoGPT model catalog, fetched with your key.
 - Streaming answers with a separate reasoning channel.
+- Provider default reasoning plus model-specific Low, Medium and High choices when the catalog declares support.
 - Tool calls through bb's dynamic tools, such as asking you a question or running a workflow.
+- Optional one-time tool confirmations and an exact-name denylist, editable under Tool controls in the settings popup.
 - Plan mode prepares a plan without executing tools, including when a model unexpectedly returns a tool call.
 - Text files you attach to a message are read and sent to the model.
 - Local PNG, JPEG, GIF and WebP images are sent as data URLs for vision-capable models.
@@ -23,11 +25,24 @@ The plugin checks your key against NanoGPT before it hands the key to the provid
 
 ## Limits
 
+Permission handling is limited to the advertised full mode. Other modes are
+rejected before execution. The bridge enforces exact session tool denials when
+supplied, rejects duplicate tool names, and reserves its history tool for internal
+restoration. The plugin's denylist setting works through public provider options,
+even though the inspected bb adapter does not forward the native denylist field.
+Optional confirmation asks before each ordinary tool call and accepts only a
+one-time decision. Oversized approval reviews are refused because the installed
+SDK limits review detail to 280 characters. This is a full-mode confirmation;
+workspace isolation and automatic review remain unsupported. See the
+[permissions and tools audit](docs/PERMISSIONS_AND_TOOLS.md) for exact behavior.
+
 Only the full permission mode is offered. bb remains the source of truth for conversation history. After `thread/resume`, the provider reads bounded pages of bb events before its first NanoGPT request and reconstructs accepted user prompts, assistant text, and normalized tool interactions. New turns are included once; historical tool calls are represented as model context and are never executed again. Stop preserves the current in-memory session; release discards provider memory while bb retains the transcript. Older completed turns are removed from model context with a visible notice when the local input budget is exceeded. The fallback budget is approximate and does not claim a verified context-window size for every model. Restored assistant/tool text is bounded to 24000 bytes with truncation markers.
 
 History restoration requires a bb version exposing the `threads.events.list()` plugin API (the project targets bb 0.49+ and `@get-bb/plugin-sdk` 0.6.133). URL images are restored. Historical local attachment bytes may no longer be available, so local files and images become filename placeholders. bb's event log does not preserve the original NanoGPT request grouping or call IDs; tool calls receive deterministic replacement IDs. A live daemon restart has not yet been verified in this environment.
 
-In bb 0.49.0 a NanoGPT thread has no file or shell tools of its own, unlike providers that bring their own. Attached text files are sent inline up to 100000 bytes; binary and unreadable files are described as unavailable. Local images are limited to 5000000 bytes each and 10000000 bytes combined per prompt; choose a model that supports vision. Reasoning effort uses the upstream model's default; low/medium/high overrides are not offered. There is no manual compaction, automatic summarization, fork, archive, rename or service-tier support.
+In bb 0.49.0 a NanoGPT thread has no file or shell tools of its own, unlike providers that bring their own. Attached text files are sent inline up to 100000 bytes; binary and unreadable files are described as unavailable. Local images are limited to 5000000 bytes each and 10000000 bytes combined per prompt; choose a model that supports vision. Reasoning defaults to Provider default. Explicit Low, Medium and High choices appear only when supported metadata is available for that model; an unsupported selection fails clearly. Old saved default selections remain defaults. There is no manual compaction, automatic summarization, fork, archive, rename or service-tier support.
+
+This overview describes the current source tree, released as package version 0.1.5. Automated tests use synthetic catalog data; authenticated composer/API verification of reasoning choices and a real history-restoring daemon restart remain outstanding.
 
 ## Support the author
 

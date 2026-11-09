@@ -24,6 +24,11 @@ to it first; the commands below are the alternative.
   `https://api.nano-gpt.com/api/v1`. HTTPS is required except for HTTP on
   localhost, 127.0.0.1 or [::1]. Credentials, query strings and fragments in a
   base URL are rejected, as are authenticated redirects.
+- `disallowedTools`: exact tool names separated by commas or whitespace. The
+  provider-options channel carries these denials on every submitted turn, so
+  they work even when bb omits the native session denylist. No wildcards.
+- `confirmToolCalls`: boolean, false by default. Enable under Tool controls in the
+  popup, or through `bb plugin config`, for one-time manual tool approvals.
 
 Read or change them with the core plugin commands:
 
@@ -68,6 +73,13 @@ request and sent as `reasoning_effort`; Provider default omits the field. Old
 saved `medium` selections keep their former Provider default meaning. If a
 model's capabilities cannot be verified, Provider default remains available.
 
+The bridge returns authoritative picker options, so missing or malformed metadata
+clears old explicit choices. If cached metadata rejects an explicit selection, it
+refreshes once before failing. An unsupported effort is never silently downgraded.
+The selection remains fixed across the turn's tool rounds and HTTP retries.
+Detailed discovery and its optional basic-list fallback share one 10-second
+deadline. See `docs/REASONING_EFFORT.md` for the complete behavior and open checks.
+
 ## Errors the user may see
 
 - "reached its output length limit": the reply was cut off. Ask the model to
@@ -83,14 +95,38 @@ model's capabilities cannot be verified, Provider default remains available.
   setup paths. Close discards unsaved fields rather than saving them.
 - An invalid model ID: choose a non-empty ID of at most 512 characters without
   control characters. Availability of a syntactically valid ID is checked upstream.
+- "does not declare ... reasoning effort": choose Provider default or an offered
+  level, or refresh the catalog. Support depends on the model, endpoint and key.
+- A history-restoration error: the resumed turn stops before generation. Check
+  plugin logs and the bb event API; do not describe the turn as having resumed
+  with complete context when restoration failed.
 
 ## Constraints
 
 - Only the full permission mode is offered.
+- bb's four permission-policy fields are retained in immutable per-request
+  snapshots. `accept-edits` and `auto` are rejected before execution; do not claim
+  workspace isolation or automatic approval review support. Registered dynamic
+  tools work in full mode. Exact `disallowedTools` entries are enforced when
+  supplied. The plugin setting additionally carries denials through public
+  provider options, without requiring native-field forwarding. Duplicate
+  names reject session construction. The hidden history tool cannot be called
+  by the model; missing/denied retrieval fails resume before generation. The
+  optional `confirmToolCalls` setting requests manual `tool_use` approval in full
+  mode. Only one-time allows without a scope grant execute. Stop and stale replies
+  cannot authorize execution. The SDK's 280-character review limit can cause
+  large calls to be refused; do not describe that refusal as successful execution.
+  `approvalEnforcedBy: "runtime"` does not supply an automatic reviewer.
+  See `docs/PERMISSIONS_AND_TOOLS.md` for the audit and implementation constraints.
 - The provider has no fork, archive, rename, manual compaction or service tier.
   It uses whole-turn context trimming rather than automatic summarization.
-- Conversation history lives in the bridge process and is lost when the host
-  daemon restarts. A resumed thread starts with an empty model context.
+- Active model context lives in the bridge process. After `thread/resume`, the
+  first active turn reads bounded saved bb events through a hidden tool before
+  generation. Accepted prompts, assistant text, URL images and normalized tool
+  interactions are reconstructed; historical tools are never executed again.
+  Local historical attachments become filename placeholders. Retrieval failure
+  fails the turn instead of continuing with empty context. The scan permits at
+  most 400 pages of 25 events; real daemon-restart verification remains open.
 - One turn runs per thread at a time. Stopping a turn ends it with one
   interrupted event and drops queued follow-up messages, while retaining its
   in-memory conversation context. Release/replacement discards that session.
@@ -103,3 +139,7 @@ model's capabilities cannot be verified, Provider default remains available.
 - For unmatched/late tool-reply diagnostics, NANOGPT_DEBUG_BRIDGE=1 in the bridge
   environment enables generic stderr messages without payloads or keys. Late
   replies after Stop/replacement are expected and still cannot revive a turn.
+
+Reasoning overrides and history restoration are part of release 0.1.5. Do not
+claim them for an older tagged installation without checking its version/source.
+Synthetic tests do not establish live composer/API compatibility.

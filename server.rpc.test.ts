@@ -31,6 +31,33 @@ afterEach(() => {
 });
 
 describe("the NanoGPT settings RPC", () => {
+  it("saves tool controls without a key or network request and normalizes exact names", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    const host = loadPlugin();
+    await expect(host.harness.behavior.callRpc("getToolSettings", null)).resolves.toEqual({ disallowedTools: "", confirmToolCalls: false });
+    await expect(host.harness.behavior.callRpc("saveToolSettings", { disallowedTools: "read_file, write_file\nread_file", confirmToolCalls: true })).resolves.toEqual({ disallowedTools: "read_file\nwrite_file", confirmToolCalls: true });
+    await expect(host.harness.behavior.callRpc("getToolSettings", null)).resolves.toEqual({ disallowedTools: "read_file\nwrite_file", confirmToolCalls: true });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it("rejects invalid tool controls without replacing saved values", async () => {
+    const host = loadPlugin();
+    const saved = { disallowedTools: "read_file", confirmToolCalls: true };
+    await host.harness.behavior.callRpc("saveToolSettings", saved);
+    await expect(host.harness.behavior.callRpc("saveToolSettings", { disallowedTools: "read_*", confirmToolCalls: false })).rejects.toThrow();
+    await expect(host.harness.behavior.callRpc("saveToolSettings", { disallowedTools: "", confirmToolCalls: "false" })).rejects.toThrow();
+    await expect(host.harness.behavior.callRpc("getToolSettings", null)).resolves.toEqual(saved);
+  });
+  it("keeps tool controls when updating the key and excludes the key from tool settings", async () => {
+    stubNanoGpt(200);
+    const host = loadPlugin();
+    const saved = { disallowedTools: "read_file", confirmToolCalls: true };
+    await host.harness.behavior.callRpc("saveToolSettings", saved);
+    await host.harness.behavior.callRpc("saveKey", { apiKey: "synthetic-secret", baseUrl: "" });
+    const next = await host.harness.behavior.callRpc("getToolSettings", null);
+    expect(next).toEqual(saved);
+    expect(JSON.stringify(next)).not.toContain("synthetic-secret");
+  });
   it("does not contribute an old key when its check finishes after removal", async () => {
     let complete!: (response: Response) => void;
     vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { complete = resolve; })));

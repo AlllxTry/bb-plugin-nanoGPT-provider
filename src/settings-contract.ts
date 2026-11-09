@@ -1,6 +1,7 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { normalizeBaseUrl } from "./base-url.js";
+import { configuredToolDenials } from "./permissions.js";
 
 export { REALTIME_KEY_STATE_CHANNEL } from "./provider-id.js";
 
@@ -36,11 +37,21 @@ const statusSchema = z
 
 export type NanoGptStatus = z.infer<typeof statusSchema>;
 
+const toolSettingsSchema = z.object({
+  disallowedTools: z.string().max(16_384).refine((value) => {
+    try { configuredToolDenials(value); return true; } catch { return false; }
+  }, "Use exact tool names separated by commas or whitespace, without wildcards."),
+  confirmToolCalls: z.boolean(),
+}).strict();
+export type ToolSettings = z.infer<typeof toolSettingsSchema>;
+
 /**
  * The frontend data plane for the composer gear. The API key only ever travels
  * from the form to the server: no method returns it.
  */
 export const nanoGptSettingsContract = defineRpcContract({
+  getToolSettings: { input: z.null(), output: toolSettingsSchema },
+  saveToolSettings: { input: toolSettingsSchema, output: toolSettingsSchema },
   getStatus: {
     input: z.null(),
     output: statusSchema,

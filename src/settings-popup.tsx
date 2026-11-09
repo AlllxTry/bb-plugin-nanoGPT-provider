@@ -2,6 +2,7 @@ import { useState, type KeyboardEvent } from "react";
 import { useComposer, useRpc } from "@get-bb/plugin-sdk/app";
 import { STATE_LABEL, useKeyStatus } from "./key-status.js";
 import type { nanoGptSettingsContract } from "./settings-contract.js";
+import { ToolSettingsPanel } from "./tool-settings.js";
 
 const INPUT_CLASS =
   "w-full rounded-md border border-border bg-surface-raised px-2 py-1.5 text-sm text-foreground focus-visible:border-ring/50 focus-visible:outline-none";
@@ -21,6 +22,7 @@ export function SettingsPopup() {
   const [baseUrlEdit, setBaseUrlEdit] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [toolSettingsOpen, setToolSettingsOpen] = useState(false);
 
   const baseUrl = baseUrlEdit ?? status?.baseUrl ?? "";
   const accepted = status?.state === "valid";
@@ -75,6 +77,7 @@ export function SettingsPopup() {
   }
 
   function close() {
+    setToolSettingsOpen(false);
     setApiKey("");
     setBaseUrlEdit(null);
     setMessage(null);
@@ -165,6 +168,10 @@ export function SettingsPopup() {
           </button>
         </div>
       </div>
+
+      <button type="button" className={QUIET_BUTTON_CLASS} aria-expanded={toolSettingsOpen}
+        onClick={() => setToolSettingsOpen(open => !open)}>Tool controls</button>
+      {toolSettingsOpen ? <ToolSettingsPanel /> : null}
 
       <a
         href="https://nano-gpt.com/api"

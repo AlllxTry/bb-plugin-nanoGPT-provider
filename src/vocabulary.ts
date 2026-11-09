@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { NANO_GPT_PROVIDER_ID } from "./provider-id.js";
 import { PROVIDER_DEFAULT_REASONING_LEVEL } from "./reasoning.js";
+import { toolControlsSchema } from "./permissions.js";
 
 export { NANO_GPT_PROVIDER_ID };
 
@@ -66,6 +67,7 @@ export const nanoGptProviderOptionsSchema = z.object({
   model: nanoGptModelIdSchema,
   baseUrl: z.string().url().nullable(),
   promptMode: z.enum(["plan"]).nullable(),
+  ...toolControlsSchema.shape,
 });
 
 export type NanoGptProviderOptions = z.infer<typeof nanoGptProviderOptionsSchema>;

@@ -108,6 +108,48 @@ describe("the settings popup", () => {
     );
   }
 
+  it("loads and saves tool controls independently of the API key", async () => {
+    const save = vi.fn(input => input);
+    const view = renderPopup({
+      getToolSettings: () => ({ disallowedTools: "old_tool", confirmToolCalls: false }),
+      saveToolSettings: save,
+    });
+    expect(view.inspection.rpcCalls.map(c => c.method)).not.toContain("getToolSettings");
+    fireEvent.click(view.getByRole("button", { name: "Tool controls" }));
+    const confirm = await view.findByLabelText("Confirm tool calls") as HTMLInputElement;
+    const denied = view.getByLabelText("Disallowed tools") as HTMLTextAreaElement;
+    expect(denied.value).toBe("old_tool");
+    fireEvent.click(confirm);
+    fireEvent.change(denied, { target: { value: "read_file, write_file" } });
+    fireEvent.click(view.getByRole("button", { name: "Save tool controls" }));
+    await vi.waitFor(() => expect(save).toHaveBeenCalledWith({ disallowedTools: "read_file, write_file", confirmToolCalls: true }));
+    expect(await view.findByText(/Tool controls saved/)).toBeTruthy();
+    expect(view.inspection.rpcCalls.map(c => c.method)).not.toContain("saveKey");
+  });
+
+  it("discards tool-control drafts when the popup closes", async () => {
+    const view = renderPopup({ getToolSettings: () => ({ disallowedTools: "saved_tool", confirmToolCalls: false }) });
+    fireEvent.click(view.getByRole("button", { name: "Tool controls" }));
+    const denied = await view.findByLabelText("Disallowed tools") as HTMLTextAreaElement;
+    fireEvent.change(denied, { target: { value: "draft_tool" } });
+    fireEvent.click(view.getByRole("button", { name: "Close" }));
+    expect(view.queryByLabelText("Disallowed tools")).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "Tool controls" }));
+    expect((await view.findByLabelText("Disallowed tools") as HTMLTextAreaElement).value).toBe("saved_tool");
+  });
+
+  it("retries loading tool controls after an RPC error", async () => {
+    let attempt = 0;
+    const view = renderPopup({ getToolSettings: () => {
+      if (++attempt === 1) throw new Error("offline");
+      return { disallowedTools: "", confirmToolCalls: false };
+    } });
+    fireEvent.click(view.getByRole("button", { name: "Tool controls" }));
+    fireEvent.click(await view.findByRole("button", { name: "Retry tool controls" }));
+    expect(await view.findByLabelText("Confirm tool calls")).toBeTruthy();
+    expect(view.queryByText("Could not load tool controls.")).toBeNull();
+  });
+
   it("shows a status error and recovers when Retry succeeds", async () => {
     let attempts = 0;
     const view = renderPopup({ getStatus: () => {
