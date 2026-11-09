@@ -9,7 +9,7 @@ Install the plugin, paste your NanoGPT API key into the plugin settings, and
 key that NanoGPT accepts is saved, the provider offers **no models at all**.
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
-This README describes the current source tree, released as package version 0.1.5.
+This README describes the current source tree, released as package version 0.1.6.
 
 Detailed references:
 

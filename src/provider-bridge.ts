@@ -1211,7 +1211,9 @@ const handlers: Record<string, RequestHandler> = {
     io.sendResult(id, {
       protocolVersion: PROVIDER_BRIDGE_PROTOCOL_VERSION,
       capabilities: {
-        grammarVersions: [THREAD_DELTA_GRAMMAR_V3],
+        // The SDK contract is an ascending [min, max] range, not a list of
+        // supported versions. A one-element array fails the host handshake.
+        grammarVersions: [THREAD_DELTA_GRAMMAR_V3, THREAD_DELTA_GRAMMAR_V3],
         sessionRestore: true,
         threadArchive: false,
         threadRename: false,

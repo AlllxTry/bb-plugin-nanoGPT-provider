@@ -5,7 +5,20 @@ reads when you install or update the plugin.
 
 ## Unreleased
 
-_None yet. Release 0.1.5 is the current tagged release._
+_None yet. Release 0.1.6 is the current tagged release._
+
+## 0.1.6 — 2026-11-09
+
+- Fix the provider handshake so bb can list NanoGPT models again. The bridge
+  reported `capabilities.grammarVersions` as `[3]`, but the SDK contract is an
+  ascending `[min, max]` pair, so the host rejected `initialize` with
+  "capabilities.grammarVersions: Too small: expected array to have >=2 items"
+  and the model picker showed "Could not load models for NanoGPT." The bridge now
+  reports `[3, 3]`.
+- Add a regression test that validates the advertised capabilities against the
+  SDK's `bridgeCapabilitiesSchema`. Verification: 281 tests, typecheck, plugin
+  build, local reinstall, and `bb provider models nano-gpt` returning the live
+  catalog.
 
 ## 0.1.5 — 2026-11-09
 

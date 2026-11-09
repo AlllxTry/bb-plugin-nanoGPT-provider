@@ -1,7 +1,7 @@
 # Permissions, approvals, and tools audit
 
 Audit date: 2026-11-09. This document describes the working tree released as
-package version 0.1.5. Installed SDK: `@get-bb/plugin-sdk` 0.6.133. The initial audit changed no runtime behavior;
+package version 0.1.6. Installed SDK: `@get-bb/plugin-sdk` 0.6.133. The initial audit changed no runtime behavior;
 follow-up implementation is described next. Baseline findings below are retained
 as historical evidence and are not the current support matrix.
 

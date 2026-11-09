@@ -42,7 +42,7 @@ History restoration requires a bb version exposing the `threads.events.list()` p
 
 In bb 0.49.0 a NanoGPT thread has no file or shell tools of its own, unlike providers that bring their own. Attached text files are sent inline up to 100000 bytes; binary and unreadable files are described as unavailable. Local images are limited to 5000000 bytes each and 10000000 bytes combined per prompt; choose a model that supports vision. Reasoning defaults to Provider default. Explicit Low, Medium and High choices appear only when supported metadata is available for that model; an unsupported selection fails clearly. Old saved default selections remain defaults. There is no manual compaction, automatic summarization, fork, archive, rename or service-tier support.
 
-This overview describes the current source tree, released as package version 0.1.5. Automated tests use synthetic catalog data; authenticated composer/API verification of reasoning choices and a real history-restoring daemon restart remain outstanding.
+This overview describes the current source tree, released as package version 0.1.6. Automated tests use synthetic catalog data; authenticated composer/API verification of reasoning choices and a real history-restoring daemon restart remain outstanding.
 
 ## Support the author
 

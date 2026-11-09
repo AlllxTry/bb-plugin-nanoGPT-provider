@@ -140,6 +140,6 @@ deadline. See `docs/REASONING_EFFORT.md` for the complete behavior and open chec
   environment enables generic stderr messages without payloads or keys. Late
   replies after Stop/replacement are expected and still cannot revive a turn.
 
-Reasoning overrides and history restoration are part of release 0.1.5. Do not
+Reasoning overrides and history restoration are part of release 0.1.6. Do not
 claim them for an older tagged installation without checking its version/source.
 Synthetic tests do not establish live composer/API compatibility.

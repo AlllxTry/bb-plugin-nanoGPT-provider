@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
+import { BRIDGE_JSON_RPC_ERRORS, bridgeCapabilitiesSchema } from "@get-bb/plugin-sdk/provider-bridge";
 import {
   experimental_createBridgeDeltaEventCollector as createBridgeDeltaEventCollector,
   experimental_createBridgeJsonRpcTestHarness as createBridgeJsonRpcTestHarness,
@@ -680,11 +680,24 @@ describe("the NanoGPT bridge", () => {
     expect(response.result).toMatchObject({
       protocolVersion: 2,
       capabilities: {
-        grammarVersions: [3],
+        grammarVersions: [3, 3],
         sessionRestore: true,
         steerMode: "queue",
       },
     });
+  });
+
+  it("answers initialize with a result the host initialize schema accepts", async () => {
+    const response = await request("initialize", {
+      protocolVersion: 2,
+      client: { name: "nano-gpt-test", version: "0.0.0" },
+      grammarVersions: [3, 3],
+    });
+    // The host parses these capabilities before it will list models.
+    const capabilities = (response.result as { capabilities?: unknown }).capabilities;
+    const parsed = bridgeCapabilitiesSchema.safeParse(capabilities);
+    expect(parsed.success, JSON.stringify(parsed.error?.issues)).toBe(true);
+    expect(parsed.data?.grammarVersions).toEqual([3, 3]);
   });
 
   it("runs a turn with one tool round and streams the final answer", async () => {
